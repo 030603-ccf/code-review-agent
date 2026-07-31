@@ -137,8 +137,7 @@ START ──► scan ──► chunk ──► fan_out(Send×N)
 │   ├── diff.py              # 增量审查
 │   └── errors.py            # 异常分类
 ├── prompts/                 # 审查/修复提示词
-├── config.yaml              # 模型配置
-└── docs/                    # 架构教学文档
+└── config.yaml              # 模型配置
 ```
 
 ---
@@ -192,11 +191,3 @@ python -m lra optimize runs/my_review/findings.json --backend api
 ```bash
 pytest tests/ -v        # 假模型 + 迷你项目，零 token
 ```
-
----
-
-## 文档
-
-- `docs/LangGraph版架构讲解.md` — 手写状态机 → LangGraph 的完整对照教学
-- `docs/LangGraph版零基础讲解.md` — Python 零基础入门教程
-- `docs/对比：LangGraph框架vs手写编排.md` — 两种实现的诚实对比
