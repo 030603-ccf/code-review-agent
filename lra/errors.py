@@ -43,7 +43,10 @@ class PermanentError(LRAError):
 
 
 # HTTP 状态码中"服务暂时不行，等会儿再试"的一类
-_RETRYABLE_STATUS_CODES = {408, 429, 502, 503, 504}
+# 402（Insufficient Balance）也算：欠费是账户状态，充值后立即可恢复——
+# 把它归为瞬时错误，充值期间的重试会自然成功（旧版归永久错误，
+# 失败块被 checkpoint 记为"已完成"，续跑永远跳过，必须全量重跑）
+_RETRYABLE_STATUS_CODES = {402, 408, 429, 502, 503, 504}
 
 
 def classify_error(exc: Exception) -> TransientError | PermanentError:

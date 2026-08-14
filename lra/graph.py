@@ -49,7 +49,7 @@ thread_id 是这次运行在账本上的**户头名**：
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from lra.nodes import Nodes
+from lra.nodes import Nodes, MAX_RETRY_ROUNDS
 from lra.state import ReviewState
 
 
@@ -93,6 +93,32 @@ def fan_out(state: ReviewState) -> list:
             for w in work]
 
 
+def fan_out_failed(state: ReviewState) -> list:
+    """aggregate 跑完后的统一路由：先补失败块，再决定终审/报告。
+
+    三态路由（取代了原来的 make_route_after_aggregate 条件边）：
+      1. failed_blocks 有欠账且轮次未满  -> 派发 retry_failed 补跑
+      2. 没有欠账 + 配了终审            -> 走 second_review
+      3. 没有欠账 + 没配终审            -> 直达 report
+
+    为什么不用闭包工厂（route_after_aggregate）：fan_out_failed 需要
+    同时知道"有没有失败块"和"配没配终审"两件事，写成一个纯函数
+    更利于测试；终审开关通过 state 的 second_client_enabled 传入。
+    轮数上限 MAX_RETRY_ROUNDS：防止图上无限循环，仍失败的进报告。
+    """
+    failed = state.get("failed_blocks", [])
+    round_no = state.get("retry_round", 0)
+    if failed and round_no < MAX_RETRY_ROUNDS:
+        return [Send("retry_failed",
+                     {"entry": b["entry"], "chunk": b["chunk"],
+                      "run_dir": state.get("run_dir", ""),
+                      "round": round_no})
+                for b in failed]
+    if state.get("second_client_enabled", False):
+        return ["second_review"]
+    return ["report"]
+
+
 def build_graph(client, second_client=None):
     """画施工图纸（未编译）。client 们在此"缝"进节点，不进 State。
 
@@ -102,14 +128,13 @@ def build_graph(client, second_client=None):
     """
     nodes = Nodes(client, second_client)
 
-    route_after_aggregate = make_route_after_aggregate(second_client)
-
     g = StateGraph(ReviewState)
 
-    # ---- 六个工位（节点名 = 原版 STAGES 里的名字，一一对应）----
+    # ---- 七个工位（节点名 = 原版 STAGES 里的名字，一一对应）----
     g.add_node("scan", nodes.scan)
     g.add_node("chunk", nodes.chunk)
     g.add_node("review_chunk", nodes.review_chunk)
+    g.add_node("retry_failed", nodes.retry_failed)
     g.add_node("aggregate", nodes.aggregate)
     g.add_node("second_review", nodes.second_review)
     g.add_node("report", nodes.report)
@@ -125,11 +150,15 @@ def build_graph(client, second_client=None):
     # 才真正触发 aggregate（图的拓扑汇合 = 原版的 await gather）
     g.add_edge("review_chunk", "aggregate")
 
-    # aggregate 之后是条件边：走不走终审，编译时就由 second_client 决定
+    # aggregate 之后是统一路由（fan_out_failed）：
+    #   有失败块 -> 补跑发牌（retry_failed 干完也汇合回 aggregate，重新算总账）
+    #   无失败块 -> 按 second_client_enabled 走终审或直达报告
     g.add_conditional_edges(
-        "aggregate", route_after_aggregate,
-        {"second_review": "second_review", "report": "report"},
+        "aggregate", fan_out_failed,
+        ["retry_failed", "second_review", "report"],
     )
+    g.add_edge("retry_failed", "aggregate")
+
     g.add_edge("second_review", "report")
     g.add_edge("report", END)          # 报告落盘，收工
     return g

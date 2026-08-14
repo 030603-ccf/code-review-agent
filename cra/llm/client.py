@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,32 @@ class APIError(Exception):
 
 class RateLimitError(APIError):
     """速率限制（HTTP 429）。Pipeline 捕获它后等 60s 重试。"""
+
+
+class _RateGate:
+    """匀速闸门：按最小间隔放行请求（线程安全）。
+
+    为什么需要它：账号 RPM 配额低时，8 个并行块齐发请求 -> 全撞 429
+    -> 全体指数退避，退避期间吞吐为零，总耗时反而更慢。
+    主动按 60/rpm 秒的间隔匀速放行，就永远不撞配额墙，
+    把"重试等待"的浪费变成"并行在飞"的有效吞吐。
+    """
+
+    def __init__(self, interval_sec: float) -> None:
+        self.interval = interval_sec
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """阻塞到距离上次放行已过 interval 秒，然后占用本次放行名额。"""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                wait = self._last + self.interval - now
+                if wait <= 0:
+                    self._last = now
+                    return
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +87,9 @@ class LLMConfig:
     # MiniMax-M3 是 thinking.type——方言收进配置，agent 代码零厂商知识）。
     # 每次请求自动带上；chat() 调用方显式传的 extra_body 优先（可临时覆盖）
     extra_body: dict | None = None
+    # 每分钟请求数上限（0 = 不限速）。低配额账号（如 DeepSeek 免费层）
+    # 配成 6 左右：客户端主动匀速放行，不撞 429，比被动退避快得多
+    rpm: int = 0
 
 
 class LLMClient:
@@ -88,6 +118,8 @@ class LLMClient:
         # 统计信息放在客户端里：agent 不用各自记账， Orchestrator 最后来这里取总数
         self._total_tokens = 0      # 累计消耗 token（prompt + completion）
         self._total_requests = 0    # 累计成功请求次数
+        # 匀速闸门：rpm>0 时启用，所有并行调用共享同一闸门（client 是单例）
+        self._gate = (_RateGate(60.0 / config.rpm) if config.rpm > 0 else None)
     # 拿到合法字段清单 → 从 yaml 字典里筛出认识的键值对 → 拍平成参数造出 LLMConfig → 再用它造出 LLMClient 返回
     @classmethod
     def from_config(cls, path: str | Path, profile: str | None = None) -> "LLMClient":
@@ -144,6 +176,9 @@ class LLMClient:
 
         for attempt in range(self.max_retries):
             try:
+                # 限速闸门：配额紧时匀速放行，从源头避免 429
+                if self._gate is not None:
+                    self._gate.acquire()
                 resp = self._client.post("/chat/completions", json=payload)
                 if resp.status_code == 429:
                     raise RateLimitError(

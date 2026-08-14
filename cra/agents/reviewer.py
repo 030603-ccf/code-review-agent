@@ -26,6 +26,15 @@ _EXT_SUPPLEMENT_MAP: dict[str, str] = {
     "jsx": "javascript.md",
     "tsx": "javascript.md",
     "vue": "javascript.md",
+    "go": "go.md",
+    "rs": "rust.md",
+    "cs": "csharp.md",
+    "c": "cpp.md",
+    "cpp": "cpp.md",
+    "cc": "cpp.md",
+    "h": "cpp.md",
+    "hpp": "cpp.md",
+    "php": "php.md",
 }
 
 # 缓存已加载的补丁内容，避免每次审查都读磁盘
@@ -57,8 +66,8 @@ _FMT = (
 )
 
 
-def _build_system_prompt(client, file_ext: str) -> str:
-    """拼装 system prompt = 基础 prompt + 语言补丁 + JSON 格式（末尾）。"""
+def _build_system_prompt(client, file_ext: str, rules_text: str = "") -> str:
+    """拼装 system prompt = 基础 prompt + 语言补丁 + 规则注入 + JSON 格式（末尾）。"""
     base = load_prompt("reviewer", profile_of(client))
     parts = [base]
 
@@ -68,6 +77,10 @@ def _build_system_prompt(client, file_ext: str) -> str:
         content = _load_supplement(lang_supplement)
         if content:
             parts.append(content)
+
+    # 规则注入：用户自定义的 glob 匹配规则（参考 OCR 的模板引擎注入）
+    if rules_text:
+        parts.append(rules_text)
 
     # JSON 格式放在最后：模型读到末尾时注意力最集中，输出最准确
     parts.append(_FMT)
@@ -173,6 +186,10 @@ def review_chunk(client, entry: dict, chunk: dict, distilled: str | None = None,
     ]
     if mistakes_text:
         user_parts.append(mistakes_text)
+    # 跨文件依赖上下文（由 lra 的 chunk 节点通过 dep_graph 生成后塞入 entry）
+    dep_ctx = entry.get("_dep_context", "")
+    if dep_ctx:
+        user_parts.append(dep_ctx)
     if ctx:
         user_parts.append(ctx)
     user_parts.append(f"```{lang}\n{chunk['text']}\n```")
@@ -187,8 +204,9 @@ def review_chunk(client, entry: dict, chunk: dict, distilled: str | None = None,
             f"【用户线索】用户怀疑以下问题可能存在，请重点核查：{hint}")
 
     messages = [
-        # system = 基础 prompt + 算法清单 + 语言补丁（按扩展名动态拼接）
-        {"role": "system", "content": _build_system_prompt(client, lang)},
+        # system = 基础 prompt + 语言补丁 + 规则注入 + JSON 格式
+        {"role": "system", "content": _build_system_prompt(
+            client, lang, entry.get("_rules_text", ""))},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
 

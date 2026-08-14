@@ -47,6 +47,11 @@ import operator
 from typing import Annotated, TypedDict
 
 
+def _max_int(a: int, b: int) -> int:
+    """取较大的整数：retry_round 的合并规则（并行分支写 round+1，取最大）。"""
+    return a if a > b else b
+
+
 class ReviewState(TypedDict, total=False):
     """审查流水线的工作台。每个键 = 一个格子，由对应节点填写。"""
 
@@ -55,6 +60,8 @@ class ReviewState(TypedDict, total=False):
     run_dir: str     # 本次运行的产物目录
     diff_files: list[str]   # 增量模式的变更文件清单（--incremental 时由 CLI 填入，chunk 只审这些）
     issue_hint: str  # 用户输入的问题线索（用于引导 LLM 审查重点）；空串 = 未启用线索模式
+    # 终审是否启用（fan_out_failed 路由用它决定补跑后走 second_review 还是 report）
+    second_client_enabled: bool
 
     # ---- scan 节点填写 ----
     project_map: dict   # 项目索引（文件清单 + 符号表），同时落盘 project_map.json
@@ -76,6 +83,17 @@ class ReviewState(TypedDict, total=False):
     # 元素是 Finding.model_dump() 的 dict 而不是 Finding 对象本身：
     # checkpoint 要把 State 写进 SQLite，dict 能 JSON 序列化，对象不能
     findings: Annotated[list[dict], operator.add]
+
+    # ---- 失败块的补跑账本（review_chunk 登记，retry_failed 消费）----
+    # 每个元素：{"entry": 文件索引条目, "chunk": 切块结果, "error": 错误摘要}
+    # reducer 是 add（只增不清）：登记后永远留在账上，
+    # fan_out_failed 每轮都重试全部失败块，直到 retry_round 到上限
+    failed_blocks: Annotated[list[dict], operator.add]
+    # 补跑轮数（max reducer）：fan_out_failed 读它决定是否再发一轮。
+    # 注意不能用普通字段——多个 retry_failed 并行分支同时写会报
+    # InvalidUpdateError（LastValue 通道每步只收一个值），
+    # max 聚合天然兼容并行写（所有分支写 round+1，取最大）
+    retry_round: Annotated[int, _max_int]
 
     # ---- aggregate / second_review 节点填写 ----
     # 质检（证据校验 + 去重 + 重排 id）之后的发现清单。

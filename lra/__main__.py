@@ -124,13 +124,29 @@ def cmd_review(args: argparse.Namespace) -> int:
             # 有账：invoke(None) 表示"不给新输入，从上次 checkpoint 接着跑"。
             #   snap.next 非空 = 上次中途被杀 -> 断点续跑
             #   snap.next 为空 = 上次已跑完   -> 直接交还旧结果，零新增请求
-            print(f"检测到 thread {thread_id} 的 checkpoint，"
-                  + ("断点续跑……" if snap.next
-                     else "上次已完整跑完，直接读结果。"))
-            result = graph.invoke(None, config)
+            if args.retry_failed and not snap.next:
+                # --retry-failed：上次跑完了但有失败块（限流/欠费），
+                # 倒带到 aggregate 节点，让 fan_out_failed 重新调度补跑
+                failed = snap.values.get("failed_blocks", [])
+                if failed:
+                    print(f"检测到 {len(failed)} 个失败块，倒带到 aggregate 补跑……")
+                    # as_node="aggregate"：假装它刚跑完，
+                    # 框架把 next 设为它的出边（fan_out_failed）
+                    graph.update_state(
+                        config, {"retry_round": 0}, as_node="aggregate")
+                    result = graph.invoke(None, config)
+                else:
+                    print("没有失败块需要补跑，直接读结果。")
+                    result = graph.invoke(None, config)
+            else:
+                print(f"检测到 thread {thread_id} 的 checkpoint，"
+                      + ("断点续跑……" if snap.next
+                         else "上次已完整跑完，直接读结果。"))
+                result = graph.invoke(None, config)
         else:
             # 没账：全新开工，把启动材料（root/run_dir）放上工作台
-            initial = {"root": str(root), "run_dir": str(run_dir)}
+            initial = {"root": str(root), "run_dir": str(run_dir),
+                       "second_client_enabled": second_client is not None}
             if diff_files:      # 增量模式：把变更清单也放上工作台
                 initial["diff_files"] = diff_files
             if args.issue_hint: # 线索模式：把用户的问题线索也放上工作台
@@ -297,6 +313,9 @@ def main() -> int:
                           help="增量模式：只审查 git diff 变更的文件")
     p_review.add_argument("--base-ref", default="HEAD~1",
                           help="增量模式的 diff 基线（默认 HEAD~1）")
+    p_review.add_argument("--retry-failed", action="store_true",
+                          help="上次跑完但存在失败块（限流/欠费）时，"
+                               "倒带补跑失败块（充值后用它续回）")
     p_review.set_defaults(func=cmd_review)
 
     # ---- optimize 子命令 ----

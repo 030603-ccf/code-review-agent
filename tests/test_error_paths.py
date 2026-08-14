@@ -107,7 +107,7 @@ def test_all_chunks_fail_graph_still_completes(tmp_path):
 
 
 def test_retry_exhausted_after_transient_errors(tmp_path):
-    """瞬时错误反复发生，重试耗尽后放弃（不无限重试）。"""
+    """瞬时错误反复发生，重试耗尽后登记补跑，补跑也失败时图仍完成。"""
     project = tmp_path / "p"
     project.mkdir()
     (project / "a.py").write_text(
@@ -119,14 +119,40 @@ def test_retry_exhausted_after_transient_errors(tmp_path):
     old_delay = nodes_mod.BASE_DELAY
     nodes_mod.BASE_DELAY = 0.01
     try:
-        # 前 4 次（MAX_RETRIES+1）都抛瞬时错误 -> 重试耗尽放弃
+        # 首试 + 5 次重试（MAX_RETRIES=5）全抛瞬时错误 -> 重试耗尽登记补跑
+        # 补跑轮（6 次）也全抛 -> 轮数到上限（MAX_RETRY_ROUNDS=1）-> 0 条进报告
         client = FlakyClient({i: (ConnectionError, "一直抖动")
-                              for i in range(1, 5)})
+                              for i in range(1, 13)})
         _run_graph(client, None, project, run_dir, thread_id="t-exhaust")
     finally:
         nodes_mod.BASE_DELAY = old_delay
 
     saved = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
     assert saved == []                     # 放弃后 0 条发现
-    assert client.call_count == 4          # 首试 + 3 次重试，没有第 5 次
+    assert client.call_count == 12         # 首轮 6 次 + 补跑轮 6 次
     assert (run_dir / "report.md").exists()
+
+
+def test_transient_exhausted_registers_retry_then_succeeds(tmp_path):
+    """瞬时错误耗尽后：补跑轮拿到机会（模拟限流缓解/充值成功）。"""
+    project = tmp_path / "p"
+    project.mkdir()
+    (project / "a.py").write_text(
+        '"""模块 a"""\n\nPASSWORD = "123456"  # 硬编码密码\n', encoding="utf-8")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    import lra.nodes as nodes_mod
+    old_delay = nodes_mod.BASE_DELAY
+    nodes_mod.BASE_DELAY = 0.01
+    try:
+        # 首试 + 5 次重试全失败；补跑轮（第 7 次起）恢复正常 -> 发现找回来
+        client = FlakyClient({i: (ConnectionError, "限流")
+                              for i in range(1, 7)})
+        _run_graph(client, None, project, run_dir, thread_id="t-retry2")
+    finally:
+        nodes_mod.BASE_DELAY = old_delay
+
+    saved = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
+    assert len(saved) == 1                 # 补跑成功，发现不丢
+    assert client.call_count == 7          # 首轮 6 次 + 补跑 1 次成功

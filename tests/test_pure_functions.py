@@ -65,6 +65,64 @@ def test_route_after_aggregate_without_judge():
     assert route({"aggregated": []}) == "report"
 
 
+# ==================== fan_out_failed（graph.py，失败块补跑路由）====================
+
+def _fake_failed_block():
+    return [{"entry": {"relpath": "a.py"},
+             "chunk": {"file": "a.py", "line_start": 1},
+             "error": "APIError: 欠费"}]
+
+
+def test_fan_out_failed_has_failed_blocks_sends_retry():
+    """有失败块且轮次未满 -> 派发 retry_failed 补跑（Send 工单）。"""
+    from lra.graph import fan_out_failed
+    result = fan_out_failed({"failed_blocks": _fake_failed_block(),
+                             "retry_round": 0})
+    assert len(result) == 1
+    assert isinstance(result[0], Send)
+    assert result[0].node == "retry_failed"
+    assert result[0].arg["round"] == 0
+
+
+def test_fan_out_failed_round_limit_reached_goes_report():
+    """轮数到上限 -> 不再补跑，直达 report（防无限循环）。"""
+    from lra.graph import fan_out_failed
+    result = fan_out_failed({"failed_blocks": _fake_failed_block(),
+                             "retry_round": 1})
+    assert result == ["report"]
+
+
+def test_fan_out_failed_no_failed_blocks_with_judge():
+    """无失败块 + 配了终审 -> 走 second_review。"""
+    from lra.graph import fan_out_failed
+    result = fan_out_failed({"failed_blocks": [], "retry_round": 0,
+                             "second_client_enabled": True})
+    assert result == ["second_review"]
+
+
+def test_fan_out_failed_no_failed_blocks_without_judge():
+    """无失败块 + 没配终审 -> 直达 report。"""
+    from lra.graph import fan_out_failed
+    result = fan_out_failed({"failed_blocks": [], "retry_round": 0,
+                             "second_client_enabled": False})
+    assert result == ["report"]
+
+
+# ==================== 402 欠费可重试（errors.py）====================
+
+def test_classify_402_insufficient_balance_is_transient():
+    """402 余额不足归为瞬时错误：充值后重试能成功，不该永久放弃。"""
+    from cra.llm.client import APIError
+    from lra.errors import classify_error, TransientError
+
+    class _R:
+        status_code = 402
+
+    err = APIError("HTTP 402: Insufficient Balance")
+    err.response = _R()
+    assert isinstance(classify_error(err), TransientError)
+
+
 # ==================== classify_error（errors.py）====================
 
 class _FakeResponse:

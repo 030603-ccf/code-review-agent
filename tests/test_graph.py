@@ -93,7 +93,8 @@ def _run_graph(client, judge, project_root, run_dir, thread_id="t-e2e"):
             str(run_dir / "checkpoints.sqlite")) as saver:
         graph = builder.compile(checkpointer=saver)
         return graph.invoke(
-            {"root": str(project_root), "run_dir": str(run_dir)}, config)
+            {"root": str(project_root), "run_dir": str(run_dir),
+             "second_client_enabled": judge is not None}, config)
 
 
 def test_graph_end_to_end(mini_project, tmp_path):

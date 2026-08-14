@@ -32,6 +32,8 @@ from pathlib import Path
 # 确定性模块原样复用：import 时起别名（as cra_xxx），
 # 一是避免和本类的方法名撞车，二是让读者一眼看出"这是借来的车"
 from cra.agents.aggregator import aggregate as cra_aggregate
+from cra.analysis.dep_graph import build_dep_graph, format_dep_context
+from cra.agents.rules import load_rules, format_rules_injection
 from cra.agents.reviewer import review_chunk as cra_review_chunk
 from cra.agents.second_reviewer import second_review as cra_second_review
 from cra.analysis.ast_scan import scan_project
@@ -48,7 +50,8 @@ from lra.tools import scan_anti_patterns, scan_security
 # ---- 单块审查的容错参数（节点级，见 review_chunk 的注释）----
 MAX_RETRIES = 5            # 瞬时错误最多重试 5 次（算上首试共 6 次机会）
 BASE_DELAY = 2.0           # 指数退避基数：2s, 4s, 8s, 16s, 32s（限流后给 API 喘息时间）
-REVIEW_TIMEOUT_SEC = 90    # 单次审查调用的超时上限（正常 <30s，90s 足够）
+REVIEW_TIMEOUT_SEC = 120   # 单次审查调用的超时上限（限流期单次调用可达 100s+，90s 会误杀；120s 兼顾容忍与不无限等）
+MAX_RETRY_ROUNDS = 1       # 失败块的补跑轮数上限：aggregate 后统一再试一轮，仍失败就进报告
 SECOND_REVIEW_WORKERS = 8  # 终审并行度（与初审不同：不受框架 max_concurrency 管，由线程池控制）
 
 # ---- 文件过滤（chunk 节点用）：这些文件不切块、不审查 ----
@@ -99,6 +102,15 @@ def _review_with_timeout(client, entry: dict, chunk: dict,
         except concurrent.futures.TimeoutError:
             raise TransientError(
                 f"审查超时（>{timeout_sec:.0f}s）")  # 不设 retry_after_sec，走指数退避
+
+
+def _failed_block(payload: dict, err_type: str, err_msg: str) -> list[dict]:
+    """把一块失败登记进 failed_blocks 账本（供 fan_out_failed 补跑）。"""
+    return [{
+        "entry": payload["entry"],
+        "chunk": payload["chunk"],
+        "error": f"{err_type}: {err_msg[:200]}",
+    }]
 
 
 class Nodes:
@@ -156,6 +168,34 @@ class Nodes:
                 work.append({"entry": entry, "chunk": c})
         logger.done(files=len(pm["files"]), chunks=len(work),
                     diff_only=bool(diff_set))
+
+        # ---------- 跨文件依赖图（零 LLM） ----------
+        # 在切块后构建依赖图，为每个 entry 注入 dep_context
+        file_contents = {}
+        for entry in pm["files"]:
+            rp = entry["relpath"]
+            if not _should_skip(rp):
+                try:
+                    file_contents[rp] = (root / rp).read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+        dep_graph = build_dep_graph(pm, file_contents)
+        for w in work:
+            rel = w["entry"]["relpath"]
+            ctx = format_dep_context(rel, dep_graph, pm)
+            if ctx:
+                w["entry"]["_dep_context"] = ctx
+
+        # ---------- 规则注入（参考 OCR 的 glob 规则匹配） ----------
+        rules = load_rules(state["root"])
+        if rules:
+            for w in work:
+                rel = w["entry"]["relpath"]
+                rules_text = format_rules_injection(rel, rules)
+                if rules_text:
+                    w["entry"]["_rules_text"] = rules_text
+
         return {"work": work}
 
     # ==================== 节点 3：review_chunk（并行扇出的工人）====================
@@ -212,7 +252,9 @@ class Nodes:
                 last_err = e
                 err = classify_error(e)
                 if isinstance(err, PermanentError):
-                    # 永久错误：不重试，直接放弃（工具发现还在）
+                    # 永久错误：不重试，直接放弃（工具发现还在）。
+                    # 也不登记补跑——烂 JSON/401 这类重跑一百次也一样，
+                    # 补跑只救得回瞬时错误（限流/欠费，见 errors.py 的 402）
                     logger.fail(f"{tag} 永久错误：{type(e).__name__}: {e}")
                     return {"findings": tool_findings}
                 if attempt >= MAX_RETRIES:
@@ -233,7 +275,10 @@ class Nodes:
         logger.fail(f"{tag} 失败（重试耗尽）："
                     f"{type(last_err).__name__}: {last_err}"
                     if last_err else f"{tag} 失败")
-        return {"findings": tool_findings}
+        return {"findings": tool_findings,
+                "failed_blocks": _failed_block(
+                    payload, type(last_err).__name__ if last_err else "unknown",
+                    str(last_err) if last_err else "")}
 
     # ==================== 节点 4：aggregate ====================
 
@@ -258,6 +303,54 @@ class Nodes:
         )
         logger.done(raw=len(findings), after_qc=len(out))
         return {"aggregated": [f.model_dump(mode="json") for f in out]}
+
+    # ==================== 节点 4.5：retry_failed（失败块补跑）====================
+
+    def retry_failed(self, payload: dict) -> dict:
+        """补跑失败块：fan_out_failed 发的牌，逻辑与 review_chunk 一致。
+
+        场景：第一轮因限流/欠费/超时失败的块，在这里拿到第二次机会。
+        充值后同 thread-id 续跑（或 --retry-failed 倒带）会走到这里。
+
+        与 review_chunk 的区别：
+          - 不再登记 failed_blocks（账本只增不清，旧记录还在）
+          - 必须返回 retry_round+1（普通覆盖字段），fan_out_failed
+            靠它判断轮数上限，否则图上会无限循环
+        """
+        chunk = payload["chunk"]
+        entry = payload["entry"]
+        tag = f"{chunk['file']}:{chunk['line_start']}-{chunk['line_end']}"
+        logger = NodeLogger(payload.get("run_dir", ""), "retry_failed")
+        logger.start(tag=tag)
+
+        # 与 review_chunk 相同的退避重试（充值期间的重试会自然成功）
+        last_err: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                fs = _review_with_timeout(self.client, entry, chunk)
+            except Exception as e:
+                last_err = e
+                err = classify_error(e)
+                if isinstance(err, PermanentError):
+                    logger.fail(f"{tag} 补跑永久错误：{type(e).__name__}: {e}")
+                    return {"findings": [], "retry_round": payload["round"] + 1}
+                if attempt >= MAX_RETRIES:
+                    break
+                delay = (err.retry_after_sec if err.retry_after_sec
+                         else BASE_DELAY * 2 ** attempt)
+                logger.skip(f"{tag} 补跑瞬时错误（{type(e).__name__}），"
+                            f"{delay:.0f}s 后第 {attempt + 1} 次重试")
+                time.sleep(delay)
+                continue
+            findings = [f.model_dump(mode="json") for f in fs]
+            logger.done(tag=tag, findings=len(findings),
+                        attempt=attempt + 1, llm=len(fs),
+                        tokens=self.client.total_tokens_used)
+            return {"findings": findings, "retry_round": payload["round"] + 1}
+
+        logger.fail(f"{tag} 补跑失败（重试耗尽）："
+                    f"{type(last_err).__name__}: {last_err}")
+        return {"findings": [], "retry_round": payload["round"] + 1}
 
     # ==================== 节点 5：second_review（可选，条件边决定走不走）====================
 
