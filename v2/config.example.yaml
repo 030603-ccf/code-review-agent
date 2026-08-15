@@ -1,0 +1,64 @@
+# Copy this file to config.yaml and fill in the environment variables that
+# hold your API keys. config.yaml is gitignored — never commit real keys.
+#
+# Every profile's `api_key_env` names an environment variable that the client
+# reads at startup. Keys live in your shell/secret-manager, not in this file.
+
+default_profile: local
+
+profiles:
+  # Local vLLM / Ollama — no real key needed.
+  local:
+    base_url: "http://localhost:8000/v1"
+    api_key_env: "VLLM_API_KEY"   # unset -> empty key (fine for local vLLM)
+    model: "qwen3-14b"
+    temperature: 0.2
+    max_tokens: 4096
+    context_length: 8192
+    timeout: 120
+
+  # Example cloud endpoint. Put the key in the named env var.
+  cloud:
+    base_url: "https://api.deepseek.com"
+    api_key_env: "DEEPSEEK_API_KEY"
+    model: "deepseek-chat"
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 60
+    rpm: 60            # requests/minute cap; the client throttles to avoid 429
+
+  # Qwen text flagship (Aliyun DashScope). Requires a STANDARD pay-as-you-go
+  # `sk-` key (NOT a Token Plan `sk-sp-` key) in DASHSCOPE_API_KEY.
+  qwen38max:
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key_env: "DASHSCOPE_API_KEY"
+    model: "qwen3.8-max-preview"
+    temperature: 0.2
+    max_tokens: 4096
+    context_length: 128000
+    timeout: 90
+    rpm: 60
+
+  # Multimodal model (Aliyun Bailian / DashScope) — for visual understanding.
+  # qwen-vl-max is the stable flagship VL model; alternatives: qwen3-vl-plus,
+  # qwen-vl-plus. Set DASHSCOPE_API_KEY in your environment.
+  vision:
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key_env: "DASHSCOPE_API_KEY"
+    model: "qwen-vl-max"
+    temperature: 0.4
+    max_tokens: 2048
+    timeout: 90
+
+review:
+  # Second-review (arbitration) profile name, or null to run single-pass.
+  second_profile: null
+  # Max parallel review chunks (LangGraph max_concurrency).
+  concurrency: 16
+
+# Optional deterministic build check run inside the optimizer workspace.
+build_check:
+  enabled: true
+  timeout: 30
+  commands:
+    py: "ruff check"
