@@ -129,6 +129,9 @@ def cmd_review(args: argparse.Namespace) -> int:
                 initial["issue_hint"] = args.issue_hint
             result = graph.invoke(initial, config)
 
+    if cache is not None:
+        cache.flush()  # 节流落盘兜底（report 节点已 flush，这里再保一次）
+
     findings = result.get("aggregated", [])
     elapsed = time.monotonic() - t0
     print("\n" + "=" * 62)

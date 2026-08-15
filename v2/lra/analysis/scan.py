@@ -11,11 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from lra.analysis.languages import LANG_BY_EXT, extract_symbols
-
-IGNORE_DIRS = {
-    ".git", ".venv", "venv", "__pycache__", ".pytest_cache",
-    "node_modules", "runs", ".idea", ".vscode", "dist", "build",
-}
+from lra.ignore import path_is_ignored
 
 
 def _sha1(path: Path) -> str:
@@ -109,7 +105,7 @@ def scan_project(root: str | Path) -> dict:
     for p in sorted(root.rglob("*")):
         if not p.is_file() or p.suffix.lower() not in exts:
             continue
-        if any(part in IGNORE_DIRS for part in p.parts):
+        if path_is_ignored(p.parts):
             continue
         files.append(scan_file(p, p.relative_to(root).as_posix()))
 

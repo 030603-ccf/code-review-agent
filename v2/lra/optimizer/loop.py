@@ -10,11 +10,16 @@
 
 import hashlib
 import json
+import threading
+import time
 from pathlib import Path
 
 from lra.optimizer.copier import hash_tree
 from lra.optimizer.fixer import FixTask
 from lra.optimizer.verifier import verify_fixes
+
+# 节流落盘间隔（秒）：与 FindingCache 一致，避免每次 put 全量重写 JSON 的 O(N²) 写放大。
+SAVE_INTERVAL_SEC = 2.0
 
 # 任务书模板版本：改 render_fix_prompt 的语义时必须 +1，缓存键随之失效
 PROMPT_VERSION = 1
@@ -23,11 +28,19 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
 class FixCache:
-    """修复结果缓存：内存 dict + 可选 JSON 落盘（断点续跑时复用）。"""
+    """修复结果缓存：内存 dict + 可选 JSON 落盘（断点续跑时复用）。
 
-    def __init__(self, path=None):
+    内存更新总是立即（加锁），落盘节流：距上次落盘超过 SAVE_INTERVAL_SEC 才写盘，
+    否则只置 dirty；优化闭环结束时 optimize_loop 调用 flush() 兜底。
+    """
+
+    def __init__(self, path=None, save_interval: float = SAVE_INTERVAL_SEC):
         self.path = Path(path) if path else None
+        self._lock = threading.Lock()
         self._data: dict = {}
+        self._dirty = False
+        self._last_save = 0.0
+        self._save_interval = save_interval
         if self.path and self.path.is_file():
             try:
                 self._data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -35,16 +48,37 @@ class FixCache:
                 self._data = {}
 
     def get(self, key: str):
-        return self._data.get(key)
+        with self._lock:
+            return self._data.get(key)
 
     def put(self, key: str, value: dict) -> None:
-        self._data[key] = value
-        if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(self._data, ensure_ascii=False),
-                           encoding="utf-8")
-            tmp.replace(self.path)
+        with self._lock:
+            self._data[key] = value
+            if self.path:
+                self._maybe_save_locked()
+
+    def _maybe_save_locked(self) -> None:
+        if time.monotonic() - self._last_save >= self._save_interval:
+            self._save_locked()
+        else:
+            self._dirty = True
+
+    def flush(self) -> None:
+        """兜底落盘：run 结束/进程退出前调用，把未落盘的 dirty 数据写下去。"""
+        if not self.path:
+            return
+        with self._lock:
+            if self._dirty:
+                self._save_locked()
+
+    def _save_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self._data, ensure_ascii=False),
+                       encoding="utf-8")
+        tmp.replace(self.path)
+        self._dirty = False
+        self._last_save = time.monotonic()
 
 
 def fix_cache_key(finding_ids, file_sha1: str, backend: str, model: str) -> str:
@@ -219,6 +253,7 @@ def optimize_loop(run_dir, copy_root, findings, state, fixer,
             break
         prev_tree = tree
 
+    cache.flush()  # 兜底落盘：节流后未落盘的修复缓存，run 结束前写盘
     final["rounds"] = len(history)
     final["history"] = history
     return final

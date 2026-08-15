@@ -11,18 +11,28 @@ runs/), guarded by a lock because review_chunk nodes run in parallel.
 
 import json
 import threading
+import time
 from pathlib import Path
 
 # 审查 prompt/schema 版本：改 reviewer prompt 或 Finding schema 时 +1，
 # 让旧缓存整体失效（否则改完规则，旧 findings 会误导下游）。
 CACHE_VERSION = "3"
 
+# 节流落盘间隔（秒）：16 并发下每个 chunk 完成都全量 json.dumps 整个 dict 落盘是
+# O(N²) 写放大。改为「内存更新总是立即（加锁），落盘节流：距上次落盘超过该间隔才
+# 落盘，否则只置 dirty」，run 结束调用 flush() 兜底。
+SAVE_INTERVAL_SEC = 2.0
+
 
 class FindingCache:
-    def __init__(self, path: str | Path | None):
+    def __init__(self, path: str | Path | None,
+                 save_interval: float = SAVE_INTERVAL_SEC):
         self.path = Path(path) if path else None
         self._lock = threading.Lock()
         self._data: dict = {}
+        self._dirty = False
+        self._last_save = 0.0
+        self._save_interval = save_interval
         if self.path and self.path.is_file():
             try:
                 self._data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -55,7 +65,22 @@ class FindingCache:
         key = self._key(relpath, sha1, line_start, line_end, model, context)
         with self._lock:
             self._data[key] = findings
+            self._maybe_save_locked()
+
+    def _maybe_save_locked(self) -> None:
+        """节流落盘：距上次落盘超过间隔才写盘，否则只置 dirty 等 flush()。"""
+        if time.monotonic() - self._last_save >= self._save_interval:
             self._save_locked()
+        else:
+            self._dirty = True
+
+    def flush(self) -> None:
+        """兜底落盘：run 结束/进程退出前调用，把未落盘的 dirty 数据写下去。"""
+        if not self.path:
+            return
+        with self._lock:
+            if self._dirty:
+                self._save_locked()
 
     def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,3 +88,5 @@ class FindingCache:
         tmp.write_text(json.dumps(self._data, ensure_ascii=False),
                        encoding="utf-8")
         tmp.replace(self.path)
+        self._dirty = False
+        self._last_save = time.monotonic()

@@ -27,6 +27,23 @@ VERIFY_SYSTEM = (
     '{"verdicts": [{"finding_id": "F1", "still_exists": true, "reason": "简短理由"}]}'
 )
 
+# 语法错误类 finding 的标题特征：build/lint 只能确定性验证「语法类」问题已消除。
+_SYNTAX_TITLE_MARKERS = ("语法", "syntax", "解析失败")
+
+
+def _build_can_verify(f) -> bool:
+    """build/lint 只能确定性验证「语法/风格类」问题已消除；语义类不能。
+
+    security/correctness 的 SQL 注入、逻辑 bug 等 ruff/lint 根本查不出来，
+    「没 lint 报错」不等于「修好了」，据此标 verified 就是假复查。只有语法错误类
+    （标题含 语法/syntax/解析失败，含 _parse_error_findings 生成的「语法解析失败」
+    correctness finding）和 best_practice 等 lint 可覆盖的类才能由 build 通过确认。
+    """
+    title = (getattr(f, "title", "") or "").lower()
+    if any(m in title for m in _SYNTAX_TITLE_MARKERS):
+        return True
+    return getattr(f, "category", "") not in {"security", "correctness"}
+
 
 class FindingVerdict(BaseModel):
     finding_id: str
@@ -134,18 +151,29 @@ def verify_fixes(run_dir, copy_root, client, state, findings,
             sorted({f.file_path for f in findings})
         report.append(f"- 模式：确定性 lint（{build_cmd}）→ "
                       f"{'通过 ✅' if bc.passed else '未通过 ❌'}")
+        report.append("- ⚠️ build 只能验证语法/风格类问题；security/correctness 等语义"
+                      "问题不会被标 verified，需 llm 复查。")
         if bc.skipped:
             report.append(f"- ⚠️ {bc.skipped}")
         for fp in files:
             for f in [x for x in findings if x.file_path == fp]:
-                if bc.passed:
-                    state.set_finding_status(f.id, "verified", "lint 通过（简化闸门）")
-                    summary["verified"].append(f.id)
-                else:
+                if not bc.passed:
                     state.set_finding_status(f.id, "remaining",
                                              bc.output or "lint 未通过")
                     summary["remaining"].append(f.id)
-            report.append(f"- {'✅' if bc.passed else '❌'} {fp}")
+                    report.append(f"- ❌ {f.id} [{f.severity}] {f.title}：lint 未通过")
+                elif _build_can_verify(f):
+                    state.set_finding_status(f.id, "verified",
+                                             "lint 通过（build 可验证此类）")
+                    summary["verified"].append(f.id)
+                    report.append(f"- ✅ {f.id} [{f.severity}] {f.title}：lint 通过")
+                else:
+                    state.set_finding_status(
+                        f.id, "remaining",
+                        "build 无法验证此类问题，需 llm 复查")
+                    summary["remaining"].append(f.id)
+                    report.append(f"- ❓ {f.id} [{f.severity}] {f.title}："
+                                  "build 无法验证此类问题，需 llm 复查")
     else:
         for file_path, fs in sorted(_group_by_file(findings, round_files).items()):
             # 只重审还没确认修好的 finding

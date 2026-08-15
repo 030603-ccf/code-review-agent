@@ -9,21 +9,13 @@ import hashlib
 import shutil
 from pathlib import Path
 
-COPY_DIR_NAME = "optimized_copy"
+from lra.ignore import is_ignored_dir_name, path_is_ignored
 
-# 复制与哈希都跳过的目录（任意层级命中即跳过）
-IGNORE_DIRS = {
-    ".git", ".hg", ".svn",
-    ".venv", "venv", "env",
-    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
-    "node_modules", "dist", "build",
-    ".idea", ".vscode",
-    "runs",
-}
+COPY_DIR_NAME = "optimized_copy"
 
 
 def _ignored(rel_parts) -> bool:
-    return any(p in IGNORE_DIRS or p.endswith(".egg-info") for p in rel_parts)
+    return path_is_ignored(rel_parts)
 
 
 def create_workspace(target_root, run_dir) -> Path:
@@ -35,7 +27,7 @@ def create_workspace(target_root, run_dir) -> Path:
         shutil.rmtree(copy_root)
 
     def _ignore(dir_path: str, names: list[str]) -> set[str]:
-        return {n for n in names if n in IGNORE_DIRS or n.endswith(".egg-info")}
+        return {n for n in names if is_ignored_dir_name(n)}
 
     shutil.copytree(target_root, copy_root, ignore=_ignore)
     return copy_root

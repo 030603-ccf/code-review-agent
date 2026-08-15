@@ -24,6 +24,7 @@ from lra.analysis.chunking import chunk_file
 from lra.analysis.dep_graph import build_dep_graph, format_dep_context
 from lra.analysis.scan import scan_project
 from lra.errors import PermanentError, classify_error
+from lra.ignore import path_is_ignored
 from lra.logger import NodeLogger
 from lra.report.markdown import render_report
 from lra.schemas.finding import Finding
@@ -34,20 +35,17 @@ BASE_DELAY = 2.0
 MAX_RETRY_ROUNDS = 1
 SECOND_REVIEW_WORKERS = 8
 SECOND_REVIEW_TIMEOUT = 120.0
+# 错题本注入上限：只把最近 N 条误报送进 prompt，跑得越多不越贵。
+MISTAKE_INJECT_LIMIT = 20
 
-SKIP_DIR_PARTS = {
-    "node_modules", ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
-    "env", "dist", "build", "out", "target", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".idea", ".vscode", "vendor", "third_party", "thirdparty",
-    "site-packages", ".tox",
-}
+# 文件级过滤（按文件名 glob），目录级过滤统一走 lra.ignore。
 SKIP_GLOBS = ("*.min.js", "*.min.css", "*.min.js.map", "*.pb.go",
               "*.generated.*", "*.pb.cc", "*.pb.h", "*.lock")
 
 
 def _should_skip(relpath: str) -> bool:
     import fnmatch
-    if any(part in SKIP_DIR_PARTS for part in Path(relpath).parts):
+    if path_is_ignored(Path(relpath).parts):
         return True
     fname = Path(relpath).name
     return any(fnmatch.fnmatch(fname, pat) for pat in SKIP_GLOBS)
@@ -109,9 +107,11 @@ class Nodes:
         (Path(state["run_dir"]) / "project_map.json").write_text(
             json.dumps(pm, ensure_ascii=False, indent=2), encoding="utf-8")
         # 错题本：run_dir 上级 memory/mistakes.jsonl（跨 run 共享），
-        # 注入 state 供 review_chunk 提醒模型别重复误报
+        # 注入 state 供 review_chunk 提醒模型别重复误报；只取最近 N 条，
+        # 防止长期运行下错题本无限膨胀、每个 chunk 的 prompt 越来越贵。
         mistakes_text = load_mistakes_text(
-            Path(state["run_dir"]).parent / "memory" / "mistakes.jsonl")
+            Path(state["run_dir"]).parent / "memory" / "mistakes.jsonl",
+            limit=MISTAKE_INJECT_LIMIT)
         logger.done(files=pm["file_count"])
         return {"project_map": pm, "mistakes_text": mistakes_text}
 
@@ -374,5 +374,8 @@ class Nodes:
                               if self.second_client else None),
         })
         (run_dir / "report.md").write_text(md, encoding="utf-8")
+        # 节流落盘兜底：review_chunk 并发 put 后可能只置了 dirty，run 结束前写盘。
+        if self.cache is not None:
+            self.cache.flush()
         logger.done(findings=len(findings), path=str(run_dir / "report.md"))
         return {"report_done": True}

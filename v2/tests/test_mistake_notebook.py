@@ -127,3 +127,50 @@ def test_load_mistakes_text(tmp_path):
     assert "除零" in text and "误报" in text
     assert load_mistakes_text(tmp_path / "nope.jsonl") == ""
     assert load_mistakes_text(None) == ""
+
+
+# --- 去重 + 注入上限 ----------------------------------------------------------
+
+def test_second_review_dedup_existing_title(tmp_path):
+    """相同 title 已在错题本里 → 不再重复写。"""
+    judge = FakeJudge(json.dumps({"verdicts": [
+        {"finding_id": "F1", "verdict": "rejected", "reason": "误报"},
+    ]}, ensure_ascii=False))
+    path = tmp_path / "mistakes.jsonl"
+    path.write_text(json.dumps({"title": "除零", "reason": "旧理由",
+                                "category": "security", "file": "a.py",
+                                "evidence": "e"},
+                               ensure_ascii=False) + "\n", encoding="utf-8")
+    second_review([_mk("F1", "除零")], tmp_path, judge, mistakes_path=path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1  # 没追加
+
+
+def test_second_review_dedup_within_batch(tmp_path):
+    """同一次调用里两个相同 title 的 rejected 只写一条。"""
+    judge = FakeJudge(json.dumps({"verdicts": [
+        {"finding_id": "F1", "verdict": "rejected", "reason": "误报"},
+        {"finding_id": "F2", "verdict": "rejected", "reason": "还是误报"},
+    ]}, ensure_ascii=False))
+    path = tmp_path / "mistakes.jsonl"
+    second_review([_mk("F1", "除零"), _mk("F2", "除零")], tmp_path, judge,
+                  mistakes_path=path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["title"] == "除零"
+
+
+def test_load_mistakes_text_limit_takes_last_n(tmp_path):
+    """注入只取最近 N 条，跑得越多不越贵。"""
+    path = tmp_path / "mistakes.jsonl"
+    path.write_text("".join(
+        json.dumps({"title": f"t{i}", "reason": f"r{i}"}, ensure_ascii=False) + "\n"
+        for i in range(5)
+    ), encoding="utf-8")
+
+    text = load_mistakes_text(path, limit=2)
+    assert "t3" in text and "t4" in text
+    assert "t0" not in text and "t2" not in text
+
+    # 不传 limit 仍全文注入（兼容旧行为）
+    assert "t1" in load_mistakes_text(path)

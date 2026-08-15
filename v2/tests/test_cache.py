@@ -177,6 +177,36 @@ def test_context_change_forces_llm_again(mini_project, tmp_path):
     assert client3.total_requests == 0
 
 
+def test_put_throttles_disk_writes(tmp_path, monkeypatch):
+    cache = FindingCache(tmp_path / "c.json")
+    saves = {"n": 0}
+    original = cache._save_locked
+
+    def counting_save():
+        saves["n"] += 1
+        original()
+
+    monkeypatch.setattr(cache, "_save_locked", counting_save)
+    for i in range(50):
+        cache.put("a.py", "s1", i, i, _findings())
+    cache.flush()
+    # 50 次 put 只有寥寥几次落盘（首次立即 + flush 兜底），远小于 put 次数
+    assert 1 <= saves["n"] <= 3
+
+
+def test_throttled_put_flushes_dirty_data(tmp_path):
+    path = tmp_path / "c.json"
+    cache = FindingCache(path)
+    cache.put("a.py", "s1", 1, 1, _findings())  # 首次立即落盘
+    cache.put("b.py", "s1", 1, 1, _findings())  # 节流窗口内只置 dirty
+    cache.flush()                                # flush 兜底写盘
+    again = FindingCache(path)
+    assert again.get("a.py", "s1", 1, 1) == _findings()
+    assert again.get("b.py", "s1", 1, 1) == _findings()
+    # 无残留 .tmp 文件
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
 def test_context_fingerprint_dimensions(tmp_path):
     from lra.__main__ import _context_fingerprint
 

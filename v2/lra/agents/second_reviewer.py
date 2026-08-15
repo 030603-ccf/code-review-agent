@@ -5,12 +5,17 @@ which makes them reusable learning material.
 """
 
 import json
+import threading
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from lra.llm.structured import chat_structured
 from lra.schemas.finding import Finding, Verdict
+
+# 错题本去重是 read-modify-write，节点层 8 个 worker 会并发写同一份
+# mistakes.jsonl；用一把进程内锁让「读现有 title → 追加」原子化。
+_MISTAKES_LOCK = threading.Lock()
 
 _SYSTEM = (
     "你是资深代码审查仲裁员。用户会给你一份初审发现清单，你要逐条裁决：\n"
@@ -33,26 +38,36 @@ class VerdictList(BaseModel):
     verdicts: list[VerdictItem]
 
 
-def load_mistakes_text(path: str | Path | None) -> str:
-    """Read a JSONL 错题本 into one prompt-ready block; "" when absent/empty."""
-    if not path:
-        return ""
-    p = Path(path)
-    if not p.is_file():
-        return ""
-    lines = []
-    for raw in p.read_text(encoding="utf-8").splitlines():
+def _read_records(path: Path) -> list[dict]:
+    """Parse a JSONL 错题本 into records, skipping blank / broken lines."""
+    records: list[dict] = []
+    if not path.is_file():
+        return records
+    for raw in path.read_text(encoding="utf-8").splitlines():
         raw = raw.strip()
         if not raw:
             continue
         try:
-            rec = json.loads(raw)
+            records.append(json.loads(raw))
         except json.JSONDecodeError:
             continue
-        title = rec.get("title", "")
-        reason = rec.get("reason", "")
-        lines.append(f"- {title}（{reason}）")
-    return "\n".join(lines)
+    return records
+
+
+def load_mistakes_text(path: str | Path | None,
+                       limit: int | None = None) -> str:
+    """Read a JSONL 错题本 into one prompt-ready block; "" when absent/empty.
+
+    `limit` caps how many of the most recent entries (last lines, append-only)
+    are injected, so a long-lived notebook never bloats every prompt.
+    """
+    if not path:
+        return ""
+    records = _read_records(Path(path))
+    if limit is not None:
+        records = records[-limit:]
+    return "\n".join(
+        f"- {r.get('title', '')}（{r.get('reason', '')}）" for r in records)
 
 
 def second_review(items: list[Finding], root, client,
@@ -89,7 +104,8 @@ def second_review(items: list[Finding], root, client,
             encoding="utf-8",
         )
 
-    # 错题本：被驳回的误报追加为 JSONL，供后续轮次提示模型不要再犯
+    # 错题本：被驳回的误报追加为 JSONL，供后续轮次提示模型不要再犯。
+    # 写前去重：相同 title 的条目（含本批内部重复）只写一次，防止无限膨胀。
     rejected = [f for f in items if f.second_verdict == "rejected"]
     if rejected:
         path = (Path(mistakes_path) if mistakes_path is not None
@@ -97,14 +113,23 @@ def second_review(items: list[Finding], root, client,
                       if save_path is not None else None))
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            records = [{
-                "title": f.title,
-                "reason": f.second_reason or "",
-                "category": f.category,
-                "file": f.file_path,
-                "evidence": f.evidence,
-            } for f in rejected]
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write("".join(
-                    json.dumps(r, ensure_ascii=False) + "\n" for r in records))
+            with _MISTAKES_LOCK:
+                existing = {r["title"] for r in _read_records(path) if r.get("title")}
+                seen: set[str] = set()
+                records: list[dict] = []
+                for f in rejected:
+                    if f.title in existing or f.title in seen:
+                        continue
+                    seen.add(f.title)
+                    records.append({
+                        "title": f.title,
+                        "reason": f.second_reason or "",
+                        "category": f.category,
+                        "file": f.file_path,
+                        "evidence": f.evidence,
+                    })
+                if records:
+                    with path.open("a", encoding="utf-8") as fh:
+                        fh.write("".join(
+                            json.dumps(r, ensure_ascii=False) + "\n" for r in records))
     return items

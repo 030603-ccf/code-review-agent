@@ -314,6 +314,56 @@ def test_run_build_check_skips_missing_command(tmp_path):
     assert result.skipped and result.passed  # 命令不存在 → skipped，不算失败
 
 
+def test_verify_fixes_build_mode_does_not_verify_security(tmp_path, monkeypatch):
+    copy_root = tmp_path / "copy"
+    (copy_root / "src").mkdir(parents=True)
+    (copy_root / "src" / "a.py").write_text("x = 2\n", encoding="utf-8")
+    findings = [Finding(
+        id="F1", category="security", severity="high",
+        file_path="src/a.py", line_start=1, line_end=1,
+        title="SQL 注入", description="拼接 SQL", evidence="sql",
+        suggestion="参数化", confidence=0.9,
+    )]
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings(findings)
+    st.set_finding_status("F1", "fixed")
+
+    from lra.optimizer import verifier as v
+    monkeypatch.setattr(v, "run_build_check",
+                        lambda *a, **k: v.BuildCheckResult(passed=True, command="ruff check"))
+    summary = verify_fixes(tmp_path / "run", copy_root, None, st, findings,
+                           round_files={"src/a.py"}, mode="build")
+    # build 无法验证语义正确性 → security 不标 verified，改标 remaining + 附注
+    assert summary["verified"] == []
+    assert summary["remaining"] == ["F1"]
+    assert st.data["findings"]["F1"]["status"] == "remaining"
+    assert "llm 复查" in st.data["findings"]["F1"]["note"]
+
+
+def test_verify_fixes_build_mode_verifies_syntax_error(tmp_path, monkeypatch):
+    copy_root = tmp_path / "copy"
+    (copy_root / "src").mkdir(parents=True)
+    (copy_root / "src" / "a.py").write_text("x = 2\n", encoding="utf-8")
+    findings = [Finding(
+        id="F1", category="correctness", severity="critical",
+        file_path="src/a.py", line_start=1, line_end=1,
+        title="语法解析失败", description="bad syntax", evidence="",
+        suggestion="fix", confidence=1.0,
+    )]
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings(findings)
+    st.set_finding_status("F1", "fixed")
+
+    from lra.optimizer import verifier as v
+    monkeypatch.setattr(v, "run_build_check",
+                        lambda *a, **k: v.BuildCheckResult(passed=True, command="ruff check"))
+    summary = verify_fixes(tmp_path / "run", copy_root, None, st, findings,
+                           round_files={"src/a.py"}, mode="build")
+    # 语法错误类 finding 可被 build 通过确认
+    assert summary["verified"] == ["F1"]
+    assert st.data["findings"]["F1"]["status"] == "verified"
+
+
 # ---------- loop ----------
 
 def test_fix_cache_key_contains_model_and_prompt_version():
@@ -325,6 +375,26 @@ def test_fix_cache_key_contains_model_and_prompt_version():
     assert f"v{PROMPT_VERSION}" in k1
     assert "api" in k1 and "model-a" in k1 and "sha1abc" in k1
     assert fix_cache_key(["F1"], "sha", "opencode", "") != k1
+
+
+def test_fix_cache_throttles_disk_writes(tmp_path, monkeypatch):
+    cache = FixCache(tmp_path / "fix.json")
+    saves = {"n": 0}
+    original = cache._save_locked
+
+    def counting_save():
+        saves["n"] += 1
+        original()
+
+    monkeypatch.setattr(cache, "_save_locked", counting_save)
+    for i in range(50):
+        cache.put(f"k{i}", {"ok": True, "code": "x"})
+    cache.flush()
+    # 50 次 put 只有寥寥几次落盘，远小于 put 次数
+    assert 1 <= saves["n"] <= 3
+    # 内存里数据全在
+    assert cache.get("k0") == {"ok": True, "code": "x"}
+    assert cache.get("k49") == {"ok": True, "code": "x"}
 
 
 def test_loop_stuck_detection(tmp_path):
