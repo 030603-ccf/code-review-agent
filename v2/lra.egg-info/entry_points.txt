@@ -1,2 +1,0 @@
-[console_scripts]
-lra = lra.__main__:main
