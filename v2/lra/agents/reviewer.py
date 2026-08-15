@@ -82,6 +82,12 @@ def review_chunk(client, entry: dict, chunk: dict,
         user_parts.append(ctx)
     if mistakes_text:
         user_parts.append(f"【历史误报，请勿再犯】{mistakes_text}")
+    lsp_candidates = entry.get("_lsp_candidates", "")
+    if lsp_candidates:
+        user_parts.append(
+            "【语言服务器候选问题】pyright 报了以下候选，请验证："
+            "真问题纳入 findings 并补全 description/suggestion；"
+            "误报或纯风格建议请忽略，不要报告\n" + lsp_candidates)
     user_parts.append(f"```{lang}\n{chunk['text']}\n```")
     hint = entry.get("_issue_hint")
     if hint:

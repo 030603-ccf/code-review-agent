@@ -22,7 +22,7 @@ from lra.agents.second_reviewer import (load_mistakes_text,
                                         second_review as do_second_review)
 from lra.analysis.chunking import chunk_file
 from lra.analysis.dep_graph import build_dep_graph, format_dep_context
-from lra.analysis.lsp import lsp_findings
+from lra.analysis.lsp import lsp_candidates_text, lsp_findings
 from lra.analysis.scan import scan_project
 from lra.errors import PermanentError, classify_error
 from lra.ignore import path_is_ignored
@@ -166,6 +166,24 @@ class Nodes:
                     w["entry"]["_dep_context"] = ctx
         except Exception:
             pass  # 依赖图是增强项，失败不影响主流程
+
+        # LSP 候选问题（warning/info/hint，需 LLM 验证）：文件级算一次塞进
+        # entry，该文件的每个 chunk 复用同一份候选文本，避免在每个
+        # review_chunk 里重复跑 LSP。没配服务器/启动失败在函数内部静默跳过。
+        if self.lsp_cfg.get("enabled"):
+            seen: set[str] = set()
+            for w in work:
+                entry = w["entry"]
+                relpath = entry.get("relpath", "")
+                if relpath in seen:
+                    continue
+                seen.add(relpath)
+                try:
+                    text = lsp_candidates_text(root, entry, self.lsp_cfg)
+                except Exception:
+                    text = ""  # LSP 候选是增强项，失败不影响主流程
+                if text:
+                    entry["_lsp_candidates"] = text
 
         logger.done(files=len(pm["files"]), chunks=len(work), diff_only=bool(diff_set))
         return {"work": work}

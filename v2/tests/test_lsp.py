@@ -8,7 +8,9 @@ publishDiagnostics 通知。由此验证 LspClient.diagnose 与 lsp_findings。
 import sys
 from pathlib import Path
 
-from lra.analysis.lsp import lsp_findings, _resolve_server_cmd
+from lra.agents.reviewer import review_chunk
+from lra.analysis.lsp import (lsp_candidates_text, lsp_findings,
+                              _resolve_server_cmd)
 from lra.lsp_client import LspClient
 
 # 一个极简 mock 语言服务器（作为子进程运行，遵守 LSP stdio framing）。
@@ -99,7 +101,8 @@ def test_diagnose_parses_content_length_framing(tmp_path):
     assert diags[3]["severity"] == 4
 
 
-def test_lsp_findings_maps_diagnostics_to_findings(tmp_path):
+def test_lsp_findings_keeps_only_error_level(tmp_path):
+    """error（severity==1）直接保留为 finding；warning/info/hint 不进 finding。"""
     server = _write_server(tmp_path)
     (tmp_path / "sample.py").write_text(CONTENT, encoding="utf-8")
 
@@ -109,7 +112,7 @@ def test_lsp_findings_maps_diagnostics_to_findings(tmp_path):
                             [{"relpath": "sample.py", "parse_error": None}],
                             lsp_cfg)
 
-    assert len(findings) == 4
+    assert len(findings) == 1  # 只有 error 级（undefined name）保留
     f = findings[0]
     assert f.category == "correctness"
     assert f.severity == "critical"
@@ -122,11 +125,93 @@ def test_lsp_findings_maps_diagnostics_to_findings(tmp_path):
     assert f.confidence == 0.9
     assert f.id == ""
 
-    # severity 映射：2→high 3→medium 4→low
-    assert [g.severity for g in findings] == ["critical", "high", "medium", "low"]
-    assert findings[1].line_start == 4 and findings[1].evidence == "w = 4"
-    assert findings[2].line_start == 6 and findings[2].evidence == "u = 6"
-    assert findings[3].line_start == 7 and findings[3].evidence == "t = 7"
+
+def test_lsp_candidates_text_formats_warning_and_above(tmp_path):
+    """warning/info/hint（severity>=2）进候选文本；error 不进候选。"""
+    server = _write_server(tmp_path)
+    (tmp_path / "sample.py").write_text(CONTENT, encoding="utf-8")
+
+    lsp_cfg = {"enabled": True,
+               "servers": {"python": [sys.executable, str(server)]}}
+    text = lsp_candidates_text(str(tmp_path),
+                               {"relpath": "sample.py", "parse_error": None},
+                               lsp_cfg)
+
+    # error 级（undefined name）不应出现在候选里
+    assert "undefined name 'foo'" not in text
+    # 三条 warning/info/hint 都在，且带 1-based 行号与 severity 名
+    lines = text.splitlines()
+    assert len(lines) == 3
+    assert lines[0] == "[行 4] Warning: unused variable 'z'"
+    assert lines[1] == "[行 6] Info: type mismatch"
+    assert lines[2] == "[行 7] Hint: hint: consider x"
+
+
+def test_lsp_candidates_text_disabled_returns_empty(tmp_path):
+    (tmp_path / "sample.py").write_text(CONTENT, encoding="utf-8")
+    lsp_cfg = {"enabled": False, "servers": {"python": "pyright-langserver --stdio"}}
+    assert lsp_candidates_text(str(tmp_path),
+                               {"relpath": "sample.py"}, lsp_cfg) == ""
+
+
+def test_lsp_candidates_text_missing_server_returns_empty(tmp_path):
+    (tmp_path / "sample.py").write_text(CONTENT, encoding="utf-8")
+    lsp_cfg = {"enabled": True,
+               "servers": {"python": "definitely-not-a-real-lsp-server-xyz"}}
+    assert lsp_candidates_text(str(tmp_path),
+                               {"relpath": "sample.py"}, lsp_cfg) == ""
+
+
+def test_lsp_candidates_text_no_configured_language_returns_empty(tmp_path):
+    (tmp_path / "sample.py").write_text(CONTENT, encoding="utf-8")
+    lsp_cfg = {"enabled": True,
+               "servers": {"javascript": "typescript-language-server --stdio"}}
+    assert lsp_candidates_text(str(tmp_path),
+                               {"relpath": "sample.py"}, lsp_cfg) == ""
+
+
+class _FakeClient:
+    """记录 user prompt 的最小 LLM client，供 review_chunk 注入测试使用。"""
+
+    total_tokens_used = 0
+
+    def __init__(self):
+        self.config = type("Cfg", (), {"model": "fake",
+                                       "context_length": 8192,
+                                       "name": ""})()
+        self.last_user = ""
+
+    def chat(self, messages, **kw):
+        self.last_user = messages[1]["content"]
+        return '{"findings": []}'
+
+
+def test_review_chunk_injects_lsp_candidates_before_code(tmp_path):
+    client = _FakeClient()
+    entry = {"relpath": "a.py", "symbols": [], "imports": [],
+             "_lsp_candidates":
+                 "[行 4] Warning: unused variable 'z'\n[行 6] Info: type mismatch"}
+    chunk = {"file": "a.py", "line_start": 1, "line_end": 2,
+             "text": "1: x = 1\n2: y = 2\n"}
+    review_chunk(client, entry, chunk)
+
+    user = client.last_user
+    assert "【语言服务器候选问题】" in user
+    assert "unused variable 'z'" in user
+    assert "type mismatch" in user
+    assert "请验证" in user
+    # 候选文本在代码块之前
+    assert user.index("【语言服务器候选问题】") < user.index("```")
+
+
+def test_review_chunk_no_candidates_when_absent(tmp_path):
+    client = _FakeClient()
+    entry = {"relpath": "a.py", "symbols": [], "imports": []}
+    chunk = {"file": "a.py", "line_start": 1, "line_end": 2,
+             "text": "1: x = 1\n2: y = 2\n"}
+    review_chunk(client, entry, chunk)
+
+    assert "【语言服务器候选问题】" not in client.last_user
 
 
 def test_lsp_findings_disabled_returns_empty(tmp_path):
