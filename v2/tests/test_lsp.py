@@ -5,12 +5,13 @@ Content-Length framing，收到 initialize 回响应、收到 didOpen 回固定�
 publishDiagnostics 通知。由此验证 LspClient.diagnose 与 lsp_findings。
 """
 
+import json
 import sys
 from pathlib import Path
 
 from lra.agents.reviewer import review_chunk
-from lra.analysis.lsp import (lsp_candidates_text, lsp_findings,
-                              _resolve_server_cmd)
+from lra.analysis.lsp import (collect_candidates, lsp_candidates_text,
+                              lsp_findings, _resolve_server_cmd)
 from lra.lsp_client import LspClient
 
 # 一个极简 mock 语言服务器（作为子进程运行，遵守 LSP stdio framing）。
@@ -190,7 +191,7 @@ def test_review_chunk_injects_lsp_candidates_before_code(tmp_path):
     client = _FakeClient()
     entry = {"relpath": "a.py", "symbols": [], "imports": [],
              "_lsp_candidates":
-                 "[行 4] Warning: unused variable 'z'\n[行 6] Info: type mismatch"}
+                 "[行 1] Warning: unused variable 'z'\n[行 2] Info: type mismatch"}
     chunk = {"file": "a.py", "line_start": 1, "line_end": 2,
              "text": "1: x = 1\n2: y = 2\n"}
     review_chunk(client, entry, chunk)
@@ -200,6 +201,8 @@ def test_review_chunk_injects_lsp_candidates_before_code(tmp_path):
     assert "unused variable 'z'" in user
     assert "type mismatch" in user
     assert "请验证" in user
+    # 文案不再硬编码 pyright
+    assert "pyright" not in user
     # 候选文本在代码块之前
     assert user.index("【语言服务器候选问题】") < user.index("```")
 
@@ -249,3 +252,160 @@ def test_resolve_server_cmd_string_and_list():
         ["pyright-langserver", "--stdio"]
     assert _resolve_server_cmd(None) == []
     assert _resolve_server_cmd("") == []
+
+
+# 记录型 mock 服务器：把 initialize 的 rootUri 与 didOpen 的 uri 追加到
+# argv[1] 指向的日志文件，便于断言「spawn 次数」「rootUri 指向哪个项目」。
+RECORDING_SERVER = '''\
+import json
+import sys
+
+LOG = sys.argv[1]
+
+
+def read_message():
+    header = b""
+    while b"\\r\\n\\r\\n" not in header:
+        ch = sys.stdin.buffer.read(1)
+        if not ch:
+            return None
+        header += ch
+    length = 0
+    for line in header.decode("ascii", "replace").split("\\r\\n"):
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":", 1)[1].strip())
+    body = sys.stdin.buffer.read(length)
+    while len(body) < length:
+        body += sys.stdin.buffer.read(length - len(body))
+    return json.loads(body.decode("utf-8"))
+
+
+def send(msg):
+    data = json.dumps(msg).encode("utf-8")
+    sys.stdout.buffer.write(
+        ("Content-Length: %d\\r\\n\\r\\n" % len(data)).encode("ascii") + data)
+    sys.stdout.buffer.flush()
+
+
+def log(record):
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\\n")
+
+
+DIAGNOSTICS = [
+    {"range": {"start": {"line": 2, "character": 0},
+               "end": {"line": 2, "character": 3}},
+     "severity": 2, "message": "unused variable 'z'"},
+]
+
+while True:
+    msg = read_message()
+    if msg is None:
+        break
+    method = msg.get("method")
+    if method == "initialize":
+        log({"type": "initialize",
+             "rootUri": msg.get("params", {}).get("rootUri")})
+        send({"jsonrpc": "2.0", "id": msg.get("id"),
+              "result": {"capabilities": {"textDocumentSync": 1}}})
+    elif method == "textDocument/didOpen":
+        uri = msg["params"]["textDocument"]["uri"]
+        log({"type": "didOpen", "uri": uri})
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+              "params": {"uri": uri, "diagnostics": DIAGNOSTICS}})
+'''
+
+
+def _write_recording_server(tmp_path: Path) -> Path:
+    server = tmp_path / "recording_lsp.py"
+    server.write_text(RECORDING_SERVER, encoding="utf-8")
+    return server
+
+
+def _read_log(path: Path) -> list[dict]:
+    return [json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_lsp_client_root_uri_uses_reviewed_project_not_cwd(tmp_path, monkeypatch):
+    """非 cwd 项目：initialize 的 rootUri 必须指向被审项目，而非运行目录。"""
+    server = _write_recording_server(tmp_path)
+    log = tmp_path / "lsp.log"
+    project = tmp_path / "some_project"
+    project.mkdir()
+    (project / "sample.py").write_text(CONTENT, encoding="utf-8")
+
+    # 把 cwd 挪到别处，确保「被审项目」≠ 进程 cwd
+    runner_cwd = tmp_path / "runner_cwd"
+    runner_cwd.mkdir()
+    monkeypatch.chdir(runner_cwd)
+
+    client = LspClient([sys.executable, str(server), str(log)], timeout=10,
+                       root_uri=str(project))
+    try:
+        client.initialize()
+    finally:
+        client.close()
+
+    records = _read_log(log)
+    root_uri = records[0]["rootUri"]
+    assert root_uri == project.resolve().as_uri()
+    assert root_uri != Path.cwd().as_uri()
+
+
+def test_lsp_client_root_uri_defaults_to_cwd(tmp_path, monkeypatch):
+    """向后兼容：不传 root_uri 时，仍沿用进程 cwd。"""
+    server = _write_recording_server(tmp_path)
+    log = tmp_path / "lsp.log"
+    runner_cwd = tmp_path / "runner_cwd"
+    runner_cwd.mkdir()
+    monkeypatch.chdir(runner_cwd)
+
+    client = LspClient([sys.executable, str(server), str(log)], timeout=10)
+    try:
+        client.initialize()
+    finally:
+        client.close()
+
+    records = _read_log(log)
+    assert records[0]["rootUri"] == Path.cwd().as_uri()
+
+
+def test_collect_candidates_spawns_once_per_language(tmp_path):
+    """多文件：同一语言只 spawn 一次服务器（1 次 initialize，N 次 didOpen）。"""
+    server = _write_recording_server(tmp_path)
+    log = tmp_path / "lsp.log"
+    (tmp_path / "a.py").write_text(CONTENT, encoding="utf-8")
+    (tmp_path / "b.py").write_text(CONTENT, encoding="utf-8")
+
+    lsp_cfg = {"enabled": True,
+               "servers": {"python": [sys.executable, str(server), str(log)]}}
+    out = collect_candidates(str(tmp_path), [
+        {"relpath": "a.py", "parse_error": None},
+        {"relpath": "b.py", "parse_error": None},
+    ], lsp_cfg)
+
+    records = _read_log(log)
+    initializes = [r for r in records if r["type"] == "initialize"]
+    did_opens = [r for r in records if r["type"] == "didOpen"]
+    assert len(initializes) == 1  # 一次 spawn
+    assert len(did_opens) == 2    # 两个文件各诊断一次
+    assert set(out) == {"a.py", "b.py"}
+    assert out["a.py"] == "[行 3] Warning: unused variable 'z'"
+    assert out["b.py"] == "[行 3] Warning: unused variable 'z'"
+
+
+def test_review_chunk_filters_candidates_by_line_range():
+    """候选行号落在 chunk 范围外的，不注入 prompt。"""
+    client = _FakeClient()
+    entry = {"relpath": "a.py", "symbols": [], "imports": [],
+             "_lsp_candidates":
+                 "[行 2] Warning: in range\n[行 5] Info: out of range"}
+    chunk = {"file": "a.py", "line_start": 1, "line_end": 3,
+             "text": "1: x = 1\n2: y = 2\n3: z = 3\n"}
+    review_chunk(client, entry, chunk)
+
+    user = client.last_user
+    assert "【语言服务器候选问题】" in user
+    assert "in range" in user
+    assert "out of range" not in user

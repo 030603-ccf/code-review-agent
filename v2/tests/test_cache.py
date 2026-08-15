@@ -230,3 +230,43 @@ def test_context_fingerprint_dimensions(tmp_path):
     fp = _context_fingerprint("", tmp_path, run_dir)
     assert fp == _context_fingerprint("", tmp_path, run_dir)
     assert len(fp) == 16
+
+
+def test_context_fingerprint_only_hashes_injected_20(tmp_path):
+    """指纹只随真正注入 prompt 的最近 20 条变化；更早条目滚出窗口后不影响。
+
+    nodes.scan 注入错题本时只取最近 MISTAKE_INJECT_LIMIT=20 条；指纹若哈希
+    整个文件，第 21 条误报一追加就全量缓存失效、重烧 token。
+    """
+    from lra.__main__ import _context_fingerprint
+    from lra.agents.second_reviewer import MISTAKE_INJECT_LIMIT
+
+    run_dir = tmp_path / "runs" / "t"
+    run_dir.mkdir(parents=True)
+    path = run_dir.parent / "memory" / "mistakes.jsonl"
+    path.parent.mkdir(parents=True)
+
+    def _write(records):
+        path.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
+            encoding="utf-8")
+
+    def _read():
+        return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+
+    # limit+1 条：注入的是最近 limit 条，最老一条（索引 0）在注入窗口之外。
+    n = MISTAKE_INJECT_LIMIT + 1
+    _write([{"title": f"t{i}", "reason": f"r{i}"} for i in range(n)])
+    base = _context_fingerprint("", tmp_path, run_dir)
+
+    # 改最老一条（窗口外）→ 指纹不变
+    records = _read()
+    records[0]["title"] = "CHANGED-OUTSIDE-WINDOW"
+    _write(records)
+    assert _context_fingerprint("", tmp_path, run_dir) == base
+
+    # 改最后一条（窗口内）→ 指纹变化
+    records = _read()
+    records[-1]["title"] = "CHANGED-INSIDE-WINDOW"
+    _write(records)
+    assert _context_fingerprint("", tmp_path, run_dir) != base

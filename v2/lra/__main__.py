@@ -17,6 +17,7 @@ import yaml
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from lra import PROJECT_ROOT
+from lra.agents.second_reviewer import MISTAKE_INJECT_LIMIT, load_mistakes_text
 from lra.cache import FindingCache
 from lra.graph import build_graph
 from lra.llm.client import LLMClient
@@ -46,13 +47,20 @@ def _read_text_or_empty(path: Path) -> str:
 
 
 def _context_fingerprint(issue_hint: str, root: Path, run_dir: Path) -> str:
-    """sha256(issue_hint + rules.json + mistakes.jsonl) 前 16 位。
+    """sha256(issue_hint + rules.json + 注入的错题本) 前 16 位。
 
     这些输入会影响 reviewer 输出却不体现在文件 sha1 里，拼进缓存键，保证
     换 hint / 改规则 / 改错题本后缓存整体失效，不会静默命中旧结果。
+
+    错题本只哈希真正注入 prompt 的那最近 ``MISTAKE_INJECT_LIMIT`` 条（与
+    ``nodes.scan`` 的注入逻辑一致）：更早的条目滚出注入窗口后不再让缓存整体
+    失效，否则长期运行下第 21 条误报一追加就全量重烧 token。rules.json 与
+    issue_hint 没有截断，保持全量哈希。
     """
     rules = _read_text_or_empty(root / ".codereview" / "rules.json")
-    mistakes = _read_text_or_empty(run_dir.parent / "memory" / "mistakes.jsonl")
+    mistakes = load_mistakes_text(
+        run_dir.parent / "memory" / "mistakes.jsonl",
+        limit=MISTAKE_INJECT_LIMIT)
     raw = "\x00".join((issue_hint or "", rules, mistakes))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 

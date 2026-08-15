@@ -38,6 +38,7 @@ python -m lra review /path/to/project --issue-hint "check for SQL injection"
 
 # after a review, run the fix loop on the findings
 python -m lra optimize runs/<thread-id> --backend api --max-rounds 3
+python -m lra optimize runs/<thread-id> --backend api --issue-hint "check for SQL injection"
 ```
 
 Resume / retry / cache:
@@ -57,14 +58,15 @@ Run artifacts land in `runs/<thread-id>/`: `project_map.json`, `findings.json`,
 | Layer | Modules |
 | --- | --- |
 | LLM | `client` (thread-safe, real httpx timeout, env-key, JSON mode) · `structured` (parse → repair → prose-extract → retry) · `prompts` (profile variants + 8 language supplements) |
-| Analysis | `scan` (ast + heuristics) · `chunking` (symbol-boundary) · `dep_graph` (cross-file import graph) |
+| Analysis | `scan` (ast + heuristics) · `chunking` (symbol-boundary) · `dep_graph` (cross-file import graph) · `lsp` (language-server diagnostics) |
 | Agents | `reviewer` · `aggregator` · `second_reviewer` · `rules` (`.codereview/rules.json`) |
-| Tools | `security_scanner` · `anti_pattern_scanner` (deterministic, zero LLM, honest confidence) |
+| Tools | `security_scanner` · `anti_pattern_scanner` · `lsp_client` (JSON-RPC over stdio) — deterministic, zero LLM, honest confidence |
 | Optimizer | `copier` · `fixer` (api/opencode, compile gate) · `verifier` · `loop` (fix cache + stall detection) |
 | Misc | `mistake_notebook` (rejected findings → negative samples) · `cache` (sha1 findings cache) |
 
-Evaluation: `python scripts/analyze.py <run_dir> <quixbugs_dir>` computes
-recall/precision against the quixbugs known-bug dataset.
+Evaluation: `python scripts/analyze.py <run_dir> <quixbugs_dir> --correct-dir
+<correct_dir>` computes recall/precision against the quixbugs known-bug dataset;
+`--correct-dir` (the corrected programs) enables the line-level recall metric.
 
 ## Configuration
 
@@ -72,6 +74,13 @@ See `config.example.yaml`. Secrets are read from environment variables named by
 each profile's `api_key_env`; keys are never stored in the repo. The `cloud`
 (DeepSeek) profile ships with `extra_body: {"thinking": {"type": "disabled"}}`
 already set — see tuning decision #1 below for why.
+
+The `lsp` section (default `enabled: false`) turns on deterministic
+language-server diagnostics: severity-Error diagnostics become `correctness`
+findings directly, while Warning/Info/Hint are injected into the reviewer prompt
+as candidates for the LLM to verify. It requires each configured server on PATH
+(`pip install pyright` provides `pyright-langserver`); missing or broken servers
+are skipped silently, so leave it off unless they are installed.
 
 ## Tuning decisions (why it's configured this way)
 
@@ -104,11 +113,16 @@ revert them without re-measuring.
 
 | Metric | Java (40 buggy) | Python (40 buggy) |
 | --- | --- | --- |
-| Recall | 95.0% (38/40) | 90.0% (36/40) |
+| Recall (line-level) | 57.5% | 60.0% |
 | File-level precision | 84.4% | 87.8% |
 | JSON failures | 0 | 0 |
 | Wall time (full run) | 28.3s | 34.2s |
 | Tokens | 59k | 61k |
+
+Recall is reported **line-level**: a finding must cover the actual bug line
+(`scripts/analyze.py --correct-dir` diffs the corrected program to locate it).
+File-level recall (~95%/~90%) merely counts a finding landing anywhere in the
+buggy file, so it inflates the number and is no longer the headline metric.
 
 Common misses (model capability boundary, not config): quicksort (drops
 pivot-equal elements) and reverse_linked_list (pointer mis-wiring) — both are
@@ -127,6 +141,5 @@ subtle logic bugs in both languages.
 
 ## Not in scope (deliberately)
 
-- **LSP diagnostics** — needs external language servers (pyright, etc.).
 - **symbol_backend / distill / aging** — the old config declared these but the
   implementations never existed; they were dead switches, not features.

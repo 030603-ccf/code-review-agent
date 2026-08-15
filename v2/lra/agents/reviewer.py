@@ -1,5 +1,7 @@
 """Reviewer — one LLM call per chunk, with out-of-chunk signature context."""
 
+import re
+
 from lra.llm.prompts import load_prompt, load_supplement
 from lra.llm.structured import chat_structured
 from lra.schemas.finding import Finding, FindingList
@@ -22,6 +24,29 @@ _FMT = (
 MAX_OUTPUT_TOKENS = 2048
 TOKEN_BUFFER = 128
 CHARS_PER_TOKEN = 3.5
+
+# 候选文本一行一个 ``[行 N] Severity: message``；只把行号落在 chunk 范围内的
+# 注入 prompt，避免让模型验证它根本看不到的行。
+_CANDIDATE_LINE_RE = re.compile(r"^\[行 (\d+)\]")
+
+
+def _filter_candidates_by_range(text: str, line_start: int, line_end: int) -> str:
+    """Keep only candidate lines whose 行号 falls within [line_start, line_end].
+
+    A chunk only shows those lines, so anything outside is noise that the model
+    cannot verify. Lines without a parseable ``[行 N]`` prefix are dropped.
+    """
+    if not text:
+        return ""
+    kept: list[str] = []
+    for line in text.splitlines():
+        m = _CANDIDATE_LINE_RE.match(line)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if line_start <= n <= line_end:
+            kept.append(line)
+    return "\n".join(kept)
 
 
 def _build_system_prompt(ext: str, rules_text: str = "", profile: str | None = None) -> str:
@@ -83,9 +108,11 @@ def review_chunk(client, entry: dict, chunk: dict,
     if mistakes_text:
         user_parts.append(f"【历史误报，请勿再犯】{mistakes_text}")
     lsp_candidates = entry.get("_lsp_candidates", "")
+    lsp_candidates = _filter_candidates_by_range(
+        lsp_candidates, chunk["line_start"], chunk["line_end"])
     if lsp_candidates:
         user_parts.append(
-            "【语言服务器候选问题】pyright 报了以下候选，请验证："
+            "【语言服务器候选问题】语言服务器报了以下候选，请验证："
             "真问题纳入 findings 并补全 description/suggestion；"
             "误报或纯风格建议请忽略，不要报告\n" + lsp_candidates)
     user_parts.append(f"```{lang}\n{chunk['text']}\n```")

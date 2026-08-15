@@ -59,9 +59,9 @@ def test_reviewer_omits_mistakes_when_empty():
 # --- second_review writes rejected to jsonl ----------------------------------
 
 
-def _mk(fid, title):
+def _mk(fid, title, file_path="a.py"):
     return Finding(id=fid, category="security", severity="high",
-                   file_path="a.py", line_start=1, line_end=1, title=title,
+                   file_path=file_path, line_start=1, line_end=1, title=title,
                    description="d", evidence="e", suggestion="s", confidence=0.9)
 
 
@@ -158,6 +158,39 @@ def test_second_review_dedup_within_batch(tmp_path):
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["title"] == "除零"
+
+
+def test_second_review_keeps_same_title_in_different_files(tmp_path):
+    """不同文件同 title 的 rejected 误报是不同样本，各自保留。"""
+    judge = FakeJudge(json.dumps({"verdicts": [
+        {"finding_id": "F1", "verdict": "rejected", "reason": "误报"},
+        {"finding_id": "F2", "verdict": "rejected", "reason": "还是误报"},
+    ]}, ensure_ascii=False))
+    path = tmp_path / "mistakes.jsonl"
+    second_review([_mk("F1", "硬编码密钥", file_path="a.py"),
+                   _mk("F2", "硬编码密钥", file_path="b.py")],
+                  tmp_path, judge, mistakes_path=path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    recs = [json.loads(line) for line in lines]
+    assert {r["file"] for r in recs} == {"a.py", "b.py"}
+    assert all(r["title"] == "硬编码密钥" for r in recs)
+
+
+def test_second_review_dedup_same_file_title_across_runs(tmp_path):
+    """同一文件同 title 跨 run 仍去重（旧记录 file 字段参与键）。"""
+    judge = FakeJudge(json.dumps({"verdicts": [
+        {"finding_id": "F1", "verdict": "rejected", "reason": "误报"},
+    ]}, ensure_ascii=False))
+    path = tmp_path / "mistakes.jsonl"
+    path.write_text(json.dumps({"title": "硬编码密钥", "reason": "旧理由",
+                                "category": "security", "file": "b.py",
+                                "evidence": "e"},
+                               ensure_ascii=False) + "\n", encoding="utf-8")
+    second_review([_mk("F1", "硬编码密钥", file_path="b.py")], tmp_path, judge,
+                  mistakes_path=path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1  # 同文件同 title，仍去重
 
 
 def test_load_mistakes_text_limit_takes_last_n(tmp_path):

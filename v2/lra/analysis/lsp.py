@@ -123,7 +123,7 @@ def lsp_findings(root, files, lsp_cfg) -> list[Finding]:
         cmd = _resolve_server_cmd(servers[lang])
         if not cmd:
             continue
-        client = LspClient(cmd, timeout=timeout)
+        client = LspClient(cmd, timeout=timeout, root_uri=str(root))
         try:
             client.initialize()
         except Exception:
@@ -151,55 +151,8 @@ def lsp_findings(root, files, lsp_cfg) -> list[Finding]:
     return out
 
 
-def lsp_candidates_text(root, entry, lsp_cfg) -> str:
-    """Run LSP on a single file and format severity>=2 diagnostics as text.
-
-    Returns candidate text for injection into the reviewer prompt, one line per
-    diagnostic like ``[行 N] Warning: message``. Returns ``""`` when there are
-    no such diagnostics, the language isn't configured, or the server fails to
-    start (silent). Error-level diagnostics are excluded here — they already
-    become deterministic findings via :func:`lsp_findings`.
-
-    File-level by design: the chunk node calls this once per file and stores
-    the result on the shared ``entry``, so every chunk of that file reuses the
-    same candidate text instead of re-running LSP per chunk.
-    """
-    cfg = lsp_cfg or {}
-    if not cfg.get("enabled"):
-        return ""
-    servers = cfg.get("servers") or {}
-    if not servers:
-        return ""
-    relpath = entry.get("relpath", "")
-    if not relpath or entry.get("parse_error"):
-        return ""
-    lang = LANG_BY_EXT.get(Path(relpath).suffix.lower(), "")
-    if not lang or not servers.get(lang):
-        return ""
-    cmd = _resolve_server_cmd(servers[lang])
-    if not cmd:
-        return ""
-    timeout = float(cfg.get("timeout", 30))
-    root = Path(root)
-    src_path = root / relpath
-    try:
-        content = src_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-    client = LspClient(cmd, timeout=timeout)
-    try:
-        try:
-            client.initialize()
-        except Exception:
-            return ""  # 服务器没装 / 启动失败：静默跳过
-        try:
-            diags = client.diagnose(str(src_path), content, lang)
-        except Exception:
-            return ""
-    finally:
-        client.close()
-
+def _format_candidates(diags: list[dict]) -> str:
+    """Format severity>=2 diagnostics as one ``[行 N] Severity: message`` line each."""
     lines: list[str] = []
     for d in diags:
         if _diag_severity(d) < 2:
@@ -213,3 +166,80 @@ def lsp_candidates_text(root, entry, lsp_cfg) -> str:
         name = _SEVERITY_NAME.get(_diag_severity(d), "Info")
         lines.append(f"[行 {line}] {name}: {message}")
     return "\n".join(lines)
+
+
+def collect_candidates(root, files, lsp_cfg) -> dict[str, str]:
+    """Run LSP once per language and collect severity>=2 candidates per file.
+
+    Returns ``{relpath: candidate_text}``. Unlike :func:`lsp_candidates_text`
+    (which spawns one server per file), this groups files by language so a
+    single language server spawns once and diagnoses every file of that
+    language in one session — 500 Python files no longer mean 500 serial
+    server cold-starts.
+
+    Error-level diagnostics are excluded here — they already become
+    deterministic findings via :func:`lsp_findings`. Missing/uninstalled
+    servers are skipped silently (the returned dict just omits those files).
+    """
+    cfg = lsp_cfg or {}
+    if not cfg.get("enabled"):
+        return {}
+    servers = cfg.get("servers") or {}
+    if not servers:
+        return {}
+    timeout = float(cfg.get("timeout", 30))
+    root = Path(root)
+
+    # Group files by language so each server spawns once per language.
+    by_lang: dict[str, list[dict]] = {}
+    for entry in files:
+        relpath = entry.get("relpath", "")
+        if entry.get("parse_error"):
+            continue  # 语法错误文件已产出 critical finding，避免重复
+        lang = LANG_BY_EXT.get(Path(relpath).suffix.lower(), "")
+        if lang and servers.get(lang):
+            by_lang.setdefault(lang, []).append(entry)
+
+    out: dict[str, str] = {}
+    for lang, entries in by_lang.items():
+        cmd = _resolve_server_cmd(servers[lang])
+        if not cmd:
+            continue
+        client = LspClient(cmd, timeout=timeout, root_uri=str(root))
+        try:
+            client.initialize()
+        except Exception:
+            # 服务器没装 / 启动失败：静默跳过该语言，不崩主流程。
+            client.close()
+            continue
+        try:
+            for entry in entries:
+                relpath = entry["relpath"]
+                src_path = root / relpath
+                try:
+                    content = src_path.read_text(encoding="utf-8",
+                                                 errors="replace")
+                    diags = client.diagnose(str(src_path), content, lang)
+                except Exception:
+                    continue  # 单文件诊断失败不影响其他文件
+                text = _format_candidates(diags)
+                if text:
+                    out[relpath] = text
+        finally:
+            client.close()
+    return out
+
+
+def lsp_candidates_text(root, entry, lsp_cfg) -> str:
+    """Return candidate text for a single file (see :func:`collect_candidates`).
+
+    Thin wrapper kept for callers/tests that only need one file: it delegates
+    to :func:`collect_candidates` and returns the file's candidate text, or
+    ``""`` when there are none. The chunk node should prefer
+    :func:`collect_candidates` to batch the whole project with one spawn per
+    language instead of spawning per file.
+    """
+    relpath = entry.get("relpath", "")
+    if not relpath:
+        return ""
+    return collect_candidates(root, [entry], lsp_cfg).get(relpath, "")

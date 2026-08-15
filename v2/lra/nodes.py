@@ -18,11 +18,12 @@ from pathlib import Path
 from lra.agents.aggregator import aggregate as do_aggregate
 from lra.agents.reviewer import review_chunk as do_review_chunk
 from lra.agents.rules import format_rules_injection, load_rules
-from lra.agents.second_reviewer import (load_mistakes_text,
+from lra.agents.second_reviewer import (MISTAKE_INJECT_LIMIT,
+                                        load_mistakes_text,
                                         second_review as do_second_review)
 from lra.analysis.chunking import chunk_file
 from lra.analysis.dep_graph import build_dep_graph, format_dep_context
-from lra.analysis.lsp import lsp_candidates_text, lsp_findings
+from lra.analysis.lsp import collect_candidates, lsp_findings
 from lra.analysis.scan import scan_project
 from lra.errors import PermanentError, classify_error
 from lra.ignore import path_is_ignored
@@ -36,8 +37,6 @@ BASE_DELAY = 2.0
 MAX_RETRY_ROUNDS = 1
 SECOND_REVIEW_WORKERS = 8
 SECOND_REVIEW_TIMEOUT = 120.0
-# 错题本注入上限：只把最近 N 条误报送进 prompt，跑得越多不越贵。
-MISTAKE_INJECT_LIMIT = 20
 
 # 文件级过滤（按文件名 glob），目录级过滤统一走 lra.ignore。
 SKIP_GLOBS = ("*.min.js", "*.min.css", "*.min.js.map", "*.pb.go",
@@ -89,6 +88,17 @@ def _parse_error_findings(files: list[dict]) -> list[Finding]:
             confidence=1.0,
         ))
     return out
+
+
+def _incremental_filter(files: list[dict], diff_set: set[str]) -> list[dict]:
+    """增量模式下只保留变更文件；全量模式（diff_set 为空）原样返回全部。
+
+    parse_error 与 LSP 确定性诊断在 aggregate 节点注入，不看 diff_files 就会
+    打破 ``--incremental`` 只审变更文件的承诺。这里统一按 relpath 过滤。
+    """
+    if not diff_set:
+        return files
+    return [f for f in files if f.get("relpath") in diff_set]
 
 
 class Nodes:
@@ -167,23 +177,23 @@ class Nodes:
         except Exception:
             pass  # 依赖图是增强项，失败不影响主流程
 
-        # LSP 候选问题（warning/info/hint，需 LLM 验证）：文件级算一次塞进
-        # entry，该文件的每个 chunk 复用同一份候选文本，避免在每个
-        # review_chunk 里重复跑 LSP。没配服务器/启动失败在函数内部静默跳过。
+        # LSP 候选问题（warning/info/hint，需 LLM 验证）：按语言分组一次
+        # spawn 服务器、一次遍历该语言所有文件，结果塞进 entry，该文件的每个
+        # chunk 复用同一份候选文本。避免旧实现每文件 spawn 一次服务器串行
+        # 白等冷启动。没配服务器/启动失败在函数内部静默跳过。
         if self.lsp_cfg.get("enabled"):
-            seen: set[str] = set()
+            unique_entries: dict[str, dict] = {}
             for w in work:
-                entry = w["entry"]
-                relpath = entry.get("relpath", "")
-                if relpath in seen:
-                    continue
-                seen.add(relpath)
-                try:
-                    text = lsp_candidates_text(root, entry, self.lsp_cfg)
-                except Exception:
-                    text = ""  # LSP 候选是增强项，失败不影响主流程
-                if text:
-                    entry["_lsp_candidates"] = text
+                relpath = w["entry"].get("relpath", "")
+                if relpath and relpath not in unique_entries:
+                    unique_entries[relpath] = w["entry"]
+            try:
+                candidates = collect_candidates(
+                    root, list(unique_entries.values()), self.lsp_cfg)
+            except Exception:
+                candidates = {}  # LSP 候选是增强项，失败不影响主流程
+            for relpath, text in candidates.items():
+                unique_entries[relpath]["_lsp_candidates"] = text
 
         logger.done(files=len(pm["files"]), chunks=len(work), diff_only=bool(diff_set))
         return {"work": work}
@@ -307,18 +317,20 @@ class Nodes:
         logger = NodeLogger(state["run_dir"], "aggregate")
         logger.start()
         findings = [Finding(**d) for d in state.get("findings", [])]
+        # 增量模式（diff_files 非空）只对变更文件注入 parse_error / LSP 诊断，
+        # 全量模式（diff_set 空）注入全部文件，二者行为与 chunk 节点一致。
+        diff_set = set(state.get("diff_files") or [])
+        inject_files = _incremental_filter(
+            (state.get("project_map") or {}).get("files", []), diff_set)
         # 语法错误文件在 chunk 节点被跳过、不进 LLM，绝不能静默消失：
         # 确定性补一条 correctness/critical finding（零 LLM，不依赖缓存）。
-        findings.extend(_parse_error_findings(
-            (state.get("project_map") or {}).get("files", [])))
+        findings.extend(_parse_error_findings(inject_files))
         # LSP 确定性诊断（零 LLM）：语言服务器产出的高精度候选 bug，
         # 与 parse_error 一样在 do_aggregate 前并入。失败/没装服务器时静默跳过。
         if self.lsp_cfg.get("enabled"):
             try:
-                findings.extend(lsp_findings(
-                    state["root"],
-                    (state.get("project_map") or {}).get("files", []),
-                    self.lsp_cfg))
+                findings.extend(lsp_findings(state["root"], inject_files,
+                                             self.lsp_cfg))
             except Exception:
                 pass  # LSP 是增强项，失败不影响主流程
         out = do_aggregate(findings, state["root"])

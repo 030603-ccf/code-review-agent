@@ -37,9 +37,13 @@ class LspError(RuntimeError):
 
 
 class LspClient:
-    def __init__(self, server_cmd: list[str], timeout: float = 30.0):
+    def __init__(self, server_cmd: list[str], timeout: float = 30.0,
+                 root_uri: str | None = None):
         self.server_cmd = list(server_cmd)
         self.timeout = timeout
+        # 工作区根目录（路径字符串）。None=进程 cwd（向后兼容）；否则对被审
+        # 项目建立工作区，语言服务器才能对着正确目录解析 import / 项目配置。
+        self.root_uri = root_uri
         self.proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._messages: queue.Queue = queue.Queue()
@@ -134,14 +138,25 @@ class LspClient:
                 return msg
 
     # ---- LSP operations ----
+    def _workspace_root_uri(self) -> str:
+        """Resolve the workspace root to a file:// URI.
+
+        ``root_uri`` (a path string) wins; when it's None the process CWD is
+        used, preserving the pre-existing behaviour for callers that review
+        from the project directory itself.
+        """
+        root = Path(self.root_uri) if self.root_uri else Path.cwd()
+        return root.resolve().as_uri()
+
     def initialize(self) -> dict:
         self._start()
+        root_uri = self._workspace_root_uri()
         resp = self._request("initialize", {
             "capabilities": {},
             # pyright needs a workspace root before it will analyze didOpen'd
-            # files; point it at the CWD (the caller reviews from the project).
-            "rootUri": Path.cwd().as_uri(),
-            "workspaceFolders": [{"uri": Path.cwd().as_uri(), "name": "workspace"}],
+            # files; point it at the reviewed project (root_uri), NOT the CWD.
+            "rootUri": root_uri,
+            "workspaceFolders": [{"uri": root_uri, "name": "workspace"}],
         })
         self._notify("initialized", {})
         return resp
