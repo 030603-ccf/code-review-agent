@@ -4,8 +4,9 @@
     1. max_rounds   轮次硬上限，防止无限烧 token
     2. 停滞检测      本轮修复后 hash_tree 与上轮完全相同 = 修改器卡住了，提前停
     3. 修复缓存      键 = (finding id 集合排序哈希 + 修复前文件 sha1
-                     + 后端名 + 模型名 + prompt 版本常量)，命中直接复用
-                     上次修复结果（文件内容），跳过 fixer 调用
+                     + 后端名 + 模型名 + issue 线索哈希 + prompt 版本常量)，
+                     命中直接复用上次修复结果（文件内容），跳过 fixer 调用；
+                     不同 issue 线索产出不同键，避免旧修复结果被误复用
 """
 
 import hashlib
@@ -81,11 +82,14 @@ class FixCache:
         self._last_save = time.monotonic()
 
 
-def fix_cache_key(finding_ids, file_sha1: str, backend: str, model: str) -> str:
-    """缓存键：必须含 finding ids + 修复前文件 sha1 + 后端名 + 模型名 + prompt 版本。"""
+def fix_cache_key(finding_ids, file_sha1: str, backend: str, model: str,
+                  issue_hint: str = "") -> str:
+    """缓存键：必须含 finding ids + 修复前文件 sha1 + 后端名 + 模型名
+    + issue 线索哈希 + prompt 版本。不同 issue 线索 → 不同键，旧修复不误复用。"""
     ids_hash = hashlib.sha256(
         ",".join(sorted(finding_ids)).encode("utf-8")).hexdigest()[:16]
-    return f"{ids_hash}|{file_sha1}|{backend}|{model}|v{PROMPT_VERSION}"
+    hint_hash = hashlib.sha256((issue_hint or "").encode("utf-8")).hexdigest()[:16]
+    return f"{ids_hash}|{file_sha1}|{backend}|{model}|h{hint_hash}|v{PROMPT_VERSION}"
 
 
 def file_sha1(content: str) -> str:
@@ -104,11 +108,23 @@ def group_by_file(findings) -> dict[str, list]:
 
 def render_fix_prompt(file_path: str, findings, code: str,
                       feedback: dict | None = None,
-                      keep: list[str] | None = None) -> str:
-    """template 模式任务书：零模型调用、结果可预测。"""
+                      keep: list[str] | None = None,
+                      issue_hint: str = "") -> str:
+    """template 模式任务书：零模型调用、结果可预测。
+
+    `issue_hint` 非空时在任务书顶部注入「用户线索」段落（置于问题清单之前），
+    引导修复围绕该 issue 描述展开；为空则不注入，行为与从前一致。
+    """
     lines = [
         f"# 修复任务：{file_path}",
         "",
+    ]
+    if issue_hint:
+        lines += [
+            f"【用户线索】用户提供了以下 issue 描述，请重点围绕它修复：{issue_hint}",
+            "",
+        ]
+    lines += [
         "请修复下面列出的问题。规则：",
         "1. 只修复列出的问题，禁止重构、改名、格式化无关代码",
         "2. 保持公共接口不变（函数名、参数、返回值），除非该接口本身就是问题",
@@ -143,12 +159,14 @@ def optimize_loop(run_dir, copy_root, findings, state, fixer,
                   build_cmd: str = "ruff check",
                   build_timeout: int = 60,
                   cache=None,
+                  issue_hint: str = "",
                   log=None) -> dict:
     """迭代主循环：修 → 复查 → 仍存在的进下一轮。返回最终汇总 + 轮次历史。
 
     fixer          修改器（api / opencode 后端）
     review_client  llm 复查模式的模型 client（build 模式可省）
     cache          FixCache 实例（默认新建内存缓存）
+    issue_hint     可选线索：非空时注入任务书并纳入缓存键，引导修复围绕它展开
     log            可选日志回调（默认静默）
     """
     run_dir = Path(run_dir)
@@ -188,9 +206,10 @@ def optimize_loop(run_dir, copy_root, findings, state, fixer,
                 continue
 
             code = target.read_text(encoding="utf-8", errors="replace")
-            key = fix_cache_key([f.id for f in fs], file_sha1(code), backend, model)
+            key = fix_cache_key([f.id for f in fs], file_sha1(code), backend,
+                                model, issue_hint)
             prompt = render_fix_prompt(file_path, fs, code, feedback,
-                                       keep.get(file_path))
+                                       keep.get(file_path), issue_hint)
             safe = file_path.replace("/", "__").replace("\\", "__")
             prompt_file = prompts_dir / f"{safe}.task.md"
             prompt_file.write_text(prompt, encoding="utf-8")

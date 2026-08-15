@@ -194,7 +194,10 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     print(f"目标项目   : {target_root}")
     print(f"审查结果   : {len(findings)} 条（{findings_path}）")
     print(f"修复后端   : {backend} · 复查模式 {args.verify} · 最多 {args.max_rounds} 轮")
-    print(f"复查模型   : {review_client.config.model}\n")
+    print(f"复查模型   : {review_client.config.model}")
+    if args.issue_hint:
+        print(f"线索模式   : {args.issue_hint}")
+    print()
 
     copy_root = create_workspace(target_root, run_dir)
     print(f"副本已建立 : {copy_root}")
@@ -219,7 +222,8 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     result = optimize_loop(
         run_dir=run_dir, copy_root=copy_root, findings=findings, state=state,
         fixer=fixer, review_client=review_client, max_rounds=args.max_rounds,
-        verify_mode=args.verify, build_cmd=build_cmd, log=print,
+        verify_mode=args.verify, build_cmd=build_cmd,
+        issue_hint=args.issue_hint or "", log=print,
     )
     elapsed = time.monotonic() - t0
 
@@ -273,6 +277,7 @@ def main() -> int:
     o.add_argument("--verify", default="llm", choices=["llm", "build"],
                    help="复查模式：llm 重审 / build 确定性闸门")
     o.add_argument("--build-cmd", default=None, help="build 模式的命令（默认 ruff check）")
+    o.add_argument("--issue-hint", default=None, help="引导修复环节重点围绕的 issue 线索")
     o.add_argument("--config", default=str(PROJECT_ROOT / "config.yaml"),
                    help="配置文件路径")
     o.set_defaults(func=cmd_optimize)
