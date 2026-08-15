@@ -59,6 +59,20 @@ review:
   # Max parallel review chunks (LangGraph max_concurrency).
   concurrency: 16
 
+# Optional deterministic LSP diagnostics (zero LLM). A language server runs
+# type checks / undefined-name checks and emits high-precision candidate bugs
+# that the LLM only needs to verify. Each `servers` value must be installed on
+# PATH — e.g. `pip install pyright` provides `pyright-langserver`. Missing or
+# broken servers are skipped silently, so leave `enabled: false` unless you
+# have the servers installed.
+lsp:
+  enabled: false
+  timeout: 30
+  servers:
+    python: "pyright-langserver --stdio"
+    # typescript: "typescript-language-server --stdio"
+    # rust: "rust-analyzer"
+
 # Optional deterministic build check run inside the optimizer workspace.
 build_check:
   enabled: true

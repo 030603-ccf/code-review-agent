@@ -66,6 +66,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     client = LLMClient.from_config(config_path, profile=args.profile)
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    lsp_cfg = cfg.get("lsp") or {}
     second_name = _resolve_second_name(
         args.second_profile, (cfg.get("review") or {}).get("second_profile"))
     second_client = (LLMClient.from_config(config_path, profile=second_name)
@@ -92,6 +93,8 @@ def cmd_review(args: argparse.Namespace) -> int:
              if second_client else "\n  二级审查 : （未启用）"))
     if args.issue_hint:
         print(f"  线索模式 : {args.issue_hint}")
+    if lsp_cfg.get("enabled"):
+        print(f"  LSP 诊断 : 已启用（servers: {', '.join((lsp_cfg.get('servers') or {}).keys()) or '无'}）")
     print("=" * 62)
 
     diff_files: list[str] | None = None
@@ -105,7 +108,8 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     t0 = time.monotonic()
     context = _context_fingerprint(args.issue_hint or "", root, run_dir)
-    builder = build_graph(client, second_client, cache, context=context)
+    builder = build_graph(client, second_client, cache, context=context,
+                          lsp_cfg=lsp_cfg)
     ckpt_path = run_dir / "checkpoints.sqlite"
 
     with SqliteSaver.from_conn_string(str(ckpt_path)) as saver:

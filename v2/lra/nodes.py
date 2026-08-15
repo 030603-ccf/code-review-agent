@@ -22,6 +22,7 @@ from lra.agents.second_reviewer import (load_mistakes_text,
                                         second_review as do_second_review)
 from lra.analysis.chunking import chunk_file
 from lra.analysis.dep_graph import build_dep_graph, format_dep_context
+from lra.analysis.lsp import lsp_findings
 from lra.analysis.scan import scan_project
 from lra.errors import PermanentError, classify_error
 from lra.ignore import path_is_ignored
@@ -91,13 +92,16 @@ def _parse_error_findings(files: list[dict]) -> list[Finding]:
 
 
 class Nodes:
-    def __init__(self, client, second_client=None, cache=None, context=""):
+    def __init__(self, client, second_client=None, cache=None, context="",
+                 lsp_cfg=None):
         self.client = client
         self.second_client = second_client
         self.cache = cache  # FindingCache | None；None=禁用
         # 缓存键的输入指纹：--issue-hint + rules.json + 错题本 的 sha256 前 16 位。
         # 这些输入影响 reviewer 输出却不体现在文件 sha1 里，必须拼进缓存键。
         self.context = context
+        # LSP 确定性诊断配置（config 的 lsp 节）；None/未启用=不跑。
+        self.lsp_cfg = lsp_cfg or {}
 
     # ---- scan ----
     def scan(self, state: dict) -> dict:
@@ -289,6 +293,16 @@ class Nodes:
         # 确定性补一条 correctness/critical finding（零 LLM，不依赖缓存）。
         findings.extend(_parse_error_findings(
             (state.get("project_map") or {}).get("files", [])))
+        # LSP 确定性诊断（零 LLM）：语言服务器产出的高精度候选 bug，
+        # 与 parse_error 一样在 do_aggregate 前并入。失败/没装服务器时静默跳过。
+        if self.lsp_cfg.get("enabled"):
+            try:
+                findings.extend(lsp_findings(
+                    state["root"],
+                    (state.get("project_map") or {}).get("files", []),
+                    self.lsp_cfg))
+            except Exception:
+                pass  # LSP 是增强项，失败不影响主流程
         out = do_aggregate(findings, state["root"])
         (Path(state["run_dir"]) / "findings.json").write_text(
             json.dumps([f.model_dump(mode="json") for f in out],

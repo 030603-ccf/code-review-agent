@@ -43,8 +43,8 @@ def fan_out_failed(state: ReviewState) -> list:
     return ["report"]
 
 
-def build_graph(client, second_client=None, cache=None, context=""):
-    nodes = Nodes(client, second_client, cache, context)
+def build_graph(client, second_client=None, cache=None, context="", lsp_cfg=None):
+    nodes = Nodes(client, second_client, cache, context, lsp_cfg)
     g = StateGraph(ReviewState)
 
     g.add_node("scan", nodes.scan)
