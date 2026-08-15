@@ -124,6 +124,38 @@ Recall is reported **line-level**: a finding must cover the actual bug line
 File-level recall (~95%/~90%) merely counts a finding landing anywhere in the
 buggy file, so it inflates the number and is no longer the headline metric.
 
+### Optimization history (effect of each change)
+
+Every number below was measured on the same quixbugs Java set (48 files) with
+`deepseek-v4-flash`, unless noted. "Before/after" are real runs, not estimates.
+
+| Change | Before | After | Gain |
+| --- | --- | --- | --- |
+| Disable thinking mode (`thinking: disabled`) | 5 JSON failures, 291k tokens, 143.8s, 50 findings | 0 failures, 59k tokens, 28.3s, 85 findings | failures zeroed · -80% tokens · 5× faster |
+| rpm 6 → 120 + concurrency 4 → 16 | full run 1439s | 143.8s | 8.4× faster |
+| sha1 findings cache | repeat run 28.3s / 59k tokens | 0.1s / 0 tokens | zero LLM requests |
+| JSON mode + prose field-extraction | failure rate 25% (12/48) | 10% (5/48) | -58% failures |
+| Second review thinking ON (`deepseek-pro-think`) | confirmed precision 35.4% | 45.2% | +10pp precision |
+| Line-level metric (`analyze.py --correct-dir`) | "recall 95%" (file-level, inflated) | 57.5% line-level (honest) | honest headline |
+
+Finding-level precision (a finding covering the real bug line, over all
+findings): Java 33.8%, Python 41.3% — the tool is recall-oriented ("rather
+over-report than miss"), which is the intended trade-off.
+
+### Test count evolution
+
+| Stage | Tests | What landed |
+| --- | --- | --- |
+| v2 rewrite | 78 | single-package core + graph/state/nodes + CLI |
+| +correctness category, field-extraction, rules, mistake notebook, profile prompts | 85 | |
+| +evaluation line-level, ignore-list merge, cache throttle, build re-verify, notebook dedupe | 107 | |
+| +LSP integration | 113 | |
+| +LSP two-stage (error direct, warning→LLM verify) | 119 | |
+| +issue-hint (review + optimize) | 124 | |
+| +notebook dedupe key (file,title), README sync | 126 | |
+| round-3 fixes (rootUri, incremental, LSP perf, fingerprint granularity) | 137 | |
+| +optimize resume + second_review thread-leak fix | 141 | |
+
 Common misses (model capability boundary, not config): quicksort (drops
 pivot-equal elements) and reverse_linked_list (pointer mis-wiring) — both are
 subtle logic bugs in both languages.
