@@ -90,11 +90,12 @@ def mini_project(tmp_path):
     return tmp_path
 
 
-def _run(client, root, run_dir, cache, thread_id):
+def _run(client, root, run_dir, cache, thread_id, context=""):
     config = {"configurable": {"thread_id": thread_id}, "max_concurrency": 3}
     with SqliteSaver.from_conn_string(
             str(run_dir / "checkpoints.sqlite")) as saver:
-        graph = build_graph(client, None, cache=cache).compile(checkpointer=saver)
+        graph = build_graph(client, None, cache=cache,
+                            context=context).compile(checkpointer=saver)
         return graph.invoke(
             {"root": str(root), "run_dir": str(run_dir),
              "second_client_enabled": False}, config)
@@ -140,3 +141,62 @@ def test_changed_sha1_forces_llm_again(mini_project, tmp_path):
     client2 = FakeClient()
     _run(client2, mini_project, run2, cache, thread_id="t-change-2")
     assert client2.total_requests == 1
+
+
+def test_context_dimension_in_key(tmp_path):
+    cache = FindingCache(tmp_path / "c.json")
+    cache.put("a.py", "s1", 1, 10, _findings(), context="ctxA")
+    assert cache.get("a.py", "s1", 1, 10, context="ctxA") == _findings()
+    # 不同 context → 不同键 → miss
+    assert cache.get("a.py", "s1", 1, 10, context="ctxB") is None
+    # 缺省 context 也不命中（键里拼了 context 维度）
+    assert cache.get("a.py", "s1", 1, 10) is None
+
+
+def test_context_change_forces_llm_again(mini_project, tmp_path):
+    cache = FindingCache(tmp_path / ".findings_cache.json")
+
+    run1 = tmp_path / "run1"
+    run1.mkdir()
+    client1 = FakeClient()
+    _run(client1, mini_project, run1, cache, "t-ctx-1", context="hint-a")
+    assert client1.total_requests == 2
+
+    # 换 context（如换 --issue-hint）→ 缓存整体失效 → 重跑 LLM
+    run2 = tmp_path / "run2"
+    run2.mkdir()
+    client2 = FakeClient()
+    _run(client2, mini_project, run2, cache, "t-ctx-2", context="hint-b")
+    assert client2.total_requests == 2
+
+    # 回到原 context → 命中缓存，0 次 LLM
+    run3 = tmp_path / "run3"
+    run3.mkdir()
+    client3 = FakeClient()
+    _run(client3, mini_project, run3, cache, "t-ctx-3", context="hint-a")
+    assert client3.total_requests == 0
+
+
+def test_context_fingerprint_dimensions(tmp_path):
+    from lra.__main__ import _context_fingerprint
+
+    run_dir = tmp_path / "runs" / "t"
+    run_dir.mkdir(parents=True)
+    base = _context_fingerprint("", tmp_path, run_dir)
+
+    # issue_hint 变化 → 指纹变化
+    assert _context_fingerprint("hint", tmp_path, run_dir) != base
+    # rules.json 内容变化 → 指纹变化
+    (tmp_path / ".codereview").mkdir()
+    (tmp_path / ".codereview" / "rules.json").write_text(
+        '{"rules": []}', encoding="utf-8")
+    assert _context_fingerprint("", tmp_path, run_dir) != base
+    # 错题本内容变化 → 指纹变化
+    (run_dir.parent / "memory").mkdir()
+    (run_dir.parent / "memory" / "mistakes.jsonl").write_text(
+        '{"title": "t", "reason": "r"}\n', encoding="utf-8")
+    assert _context_fingerprint("", tmp_path, run_dir) != base
+    # 相同输入 → 相同指纹（确定性，长度 16）
+    fp = _context_fingerprint("", tmp_path, run_dir)
+    assert fp == _context_fingerprint("", tmp_path, run_dir)
+    assert len(fp) == 16

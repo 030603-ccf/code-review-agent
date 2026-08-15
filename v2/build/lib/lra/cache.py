@@ -1,12 +1,9 @@
-"""Cross-run findings cache keyed by (file, sha1, chunk line range, context).
+"""Cross-run findings cache keyed by (file, sha1, chunk line range).
 
 scan already computes a per-file sha1; this cache reuses it so that unchanged
-files skip the LLM entirely on subsequent runs. The `context` dimension is a
-fingerprint of every input that affects the reviewer prompt but is not covered
-by the file sha1 (issue hint, project rules, mistake notebook) — changing any
-of them produces a different key, so the cache never silently serves stale
-findings. The cache is a single JSON file shared across thread_ids (it lives in
-runs/), guarded by a lock because review_chunk nodes run in parallel.
+files skip the LLM entirely on subsequent runs. The cache is a single JSON file
+shared across thread_ids (it lives in runs/), guarded by a lock because
+review_chunk nodes run in parallel.
 """
 
 import json
@@ -34,25 +31,24 @@ class FindingCache:
 
     @staticmethod
     def _key(relpath: str, sha1: str, line_start: int, line_end: int,
-             model: str = "", context: str = "") -> str:
+             model: str = "") -> str:
         return (f"{CACHE_VERSION}\x00{model}\x00{relpath}\x00{sha1}"
-                f"\x00{line_start}\x00{line_end}\x00{context}")
+                f"\x00{line_start}\x00{line_end}")
 
     def get(self, relpath: str, sha1: str,
-            line_start: int, line_end: int, model: str = "",
-            context: str = "") -> list[dict] | None:
+            line_start: int, line_end: int, model: str = "") -> list[dict] | None:
         if not self.path:
             return None
-        key = self._key(relpath, sha1, line_start, line_end, model, context)
+        key = self._key(relpath, sha1, line_start, line_end, model)
         with self._lock:
             return self._data.get(key)
 
     def put(self, relpath: str, sha1: str,
             line_start: int, line_end: int, findings: list[dict],
-            model: str = "", context: str = "") -> None:
+            model: str = "") -> None:
         if not self.path:
             return
-        key = self._key(relpath, sha1, line_start, line_end, model, context)
+        key = self._key(relpath, sha1, line_start, line_end, model)
         with self._lock:
             self._data[key] = findings
             self._save_locked()

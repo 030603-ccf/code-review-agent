@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from lra.errors import PermanentError, TransientError, classify_error
+from lra.nodes import _parse_error_findings, _parse_error_line
 from lra.schemas.finding import Finding
 from lra.state import _merge_failed
 from lra.tools import normalize_lang
@@ -82,3 +83,31 @@ def test_finding_accepts_correctness_category():
 def test_finding_rejects_unknown_category():
     with pytest.raises(ValidationError):
         _finding("nonsense")
+
+
+def test_parse_error_line_extracts_number():
+    assert _parse_error_line("invalid syntax (line 3)") == 3
+    assert _parse_error_line("expected ':' (line 12)") == 12
+
+
+def test_parse_error_line_falls_back_to_one():
+    assert _parse_error_line("unexpected EOF while parsing") == 1
+    assert _parse_error_line("") == 1
+
+
+def test_parse_error_findings_builds_correctness():
+    files = [
+        {"relpath": "bad.py", "parse_error": "invalid syntax (line 3)"},
+        {"relpath": "ok.py", "parse_error": None},
+    ]
+    out = _parse_error_findings(files)
+    assert len(out) == 1
+    f = out[0]
+    assert f.category == "correctness"
+    assert f.severity == "critical"
+    assert f.file_path == "bad.py"
+    assert (f.line_start, f.line_end) == (3, 3)
+    assert f.title == "语法解析失败"
+    assert f.description == "invalid syntax (line 3)"
+    assert f.evidence == ""
+    assert f.confidence == 1.0

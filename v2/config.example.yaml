@@ -26,6 +26,9 @@ profiles:
     max_tokens: 4096
     timeout: 60
     rpm: 60            # requests/minute cap; the client throttles to avoid 429
+    # DeepSeek thinking mode is ON by default and ignores `temperature`;
+    # reasoning_content bloats the JSON output. Disable it explicitly.
+    extra_body: {"thinking": {"type": "disabled"}}
 
   # Qwen text flagship (Aliyun DashScope). Requires a STANDARD pay-as-you-go
   # `sk-` key (NOT a Token Plan `sk-sp-` key) in DASHSCOPE_API_KEY.

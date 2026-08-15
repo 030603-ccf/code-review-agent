@@ -11,7 +11,6 @@ top of it we retry transient errors with exponential backoff.
 
 import concurrent.futures
 import json
-import re
 import time
 from pathlib import Path
 
@@ -53,53 +52,11 @@ def _should_skip(relpath: str) -> bool:
     return any(fnmatch.fnmatch(fname, pat) for pat in SKIP_GLOBS)
 
 
-def _parse_error_line(msg: str) -> int:
-    """Extract the failing line number from scan's parse_error string.
-
-    scan_file formats it as ``f"{e.msg} (line {e.lineno})"``; fall back to 1
-    when the line number cannot be parsed.
-    """
-    m = re.search(r"\(line (\d+)\)", msg or "")
-    return int(m.group(1)) if m else 1
-
-
-def _parse_error_findings(files: list[dict]) -> list[Finding]:
-    """Deterministic correctness findings for files that failed to parse.
-
-    These files are skipped in the chunk node (never sent to the LLM); without
-    this they would vanish from the report entirely. Zero LLM — built straight
-    from scan's ``parse_error`` field.
-    """
-    out: list[Finding] = []
-    for entry in files:
-        msg = entry.get("parse_error")
-        if not msg:
-            continue
-        line = _parse_error_line(str(msg))
-        out.append(Finding(
-            id="",
-            category="correctness",
-            severity="critical",
-            file_path=entry["relpath"],
-            line_start=line,
-            line_end=line,
-            title="语法解析失败",
-            description=str(msg),
-            evidence="",
-            suggestion="修复语法错误后重新审查",
-            confidence=1.0,
-        ))
-    return out
-
-
 class Nodes:
-    def __init__(self, client, second_client=None, cache=None, context=""):
+    def __init__(self, client, second_client=None, cache=None):
         self.client = client
         self.second_client = second_client
         self.cache = cache  # FindingCache | None；None=禁用
-        # 缓存键的输入指纹：--issue-hint + rules.json + 错题本 的 sha256 前 16 位。
-        # 这些输入影响 reviewer 输出却不体现在文件 sha1 里，必须拼进缓存键。
-        self.context = context
 
     # ---- scan ----
     def scan(self, state: dict) -> dict:
@@ -187,8 +144,7 @@ class Nodes:
         model = self.client.config.model
         if self.cache is not None:
             cached = self.cache.get(relpath, sha1,
-                                    chunk["line_start"], chunk["line_end"], model,
-                                    context=self.context)
+                                    chunk["line_start"], chunk["line_end"], model)
             if cached is not None:
                 logger.done(tag=tag + "（缓存命中）", findings=len(cached))
                 return {"findings": cached}
@@ -214,7 +170,7 @@ class Nodes:
                     if self.cache is not None:
                         self.cache.put(relpath, sha1,
                                        chunk["line_start"], chunk["line_end"],
-                                       tool_findings, model, context=self.context)
+                                       tool_findings, model)
                     return {"findings": tool_findings}
                 if attempt >= MAX_RETRIES:
                     break
@@ -225,7 +181,7 @@ class Nodes:
             if self.cache is not None:
                 self.cache.put(relpath, sha1,
                                chunk["line_start"], chunk["line_end"],
-                               all_findings, model, context=self.context)
+                               all_findings, model)
             logger.done(tag=tag, findings=len(all_findings),
                         tool=len(tool_findings), llm=len(fs))
             return {"findings": all_findings}
@@ -259,7 +215,7 @@ class Nodes:
                     if self.cache is not None:
                         self.cache.put(relpath, sha1,
                                        chunk["line_start"], chunk["line_end"],
-                                       [], model, context=self.context)
+                                       [], model)
                     break
                 if attempt >= MAX_RETRIES:
                     break
@@ -270,7 +226,7 @@ class Nodes:
             if self.cache is not None:
                 self.cache.put(relpath, sha1,
                                chunk["line_start"], chunk["line_end"],
-                               findings, model, context=self.context)
+                               findings, model)
             logger.done(tag=tag, findings=len(findings))
             return {"findings": findings, "retry_round": payload["round"] + 1,
                     "failed_blocks": [{"entry": entry, "chunk": chunk, "resolved": True}]}
@@ -285,10 +241,6 @@ class Nodes:
         logger = NodeLogger(state["run_dir"], "aggregate")
         logger.start()
         findings = [Finding(**d) for d in state.get("findings", [])]
-        # 语法错误文件在 chunk 节点被跳过、不进 LLM，绝不能静默消失：
-        # 确定性补一条 correctness/critical finding（零 LLM，不依赖缓存）。
-        findings.extend(_parse_error_findings(
-            (state.get("project_map") or {}).get("files", [])))
         out = do_aggregate(findings, state["root"])
         (Path(state["run_dir"]) / "findings.json").write_text(
             json.dumps([f.model_dump(mode="json") for f in out],

@@ -6,7 +6,6 @@ checkpoint instead of starting over.
 """
 
 import argparse
-import hashlib
 import json
 import sys
 import time
@@ -36,25 +35,6 @@ def _resolve_second_name(cli_value, cfg_value):
         v = str(v).strip()
         return None if v.lower() in _SECOND_OFF else v
     return _norm(cli_value) if cli_value is not None else _norm(cfg_value)
-
-
-def _read_text_or_empty(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8") if path.is_file() else ""
-    except OSError:
-        return ""
-
-
-def _context_fingerprint(issue_hint: str, root: Path, run_dir: Path) -> str:
-    """sha256(issue_hint + rules.json + mistakes.jsonl) 前 16 位。
-
-    这些输入会影响 reviewer 输出却不体现在文件 sha1 里，拼进缓存键，保证
-    换 hint / 改规则 / 改错题本后缓存整体失效，不会静默命中旧结果。
-    """
-    rules = _read_text_or_empty(root / ".codereview" / "rules.json")
-    mistakes = _read_text_or_empty(run_dir.parent / "memory" / "mistakes.jsonl")
-    raw = "\x00".join((issue_hint or "", rules, mistakes))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -104,8 +84,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             print("增量模式：非 git 仓库或没有变更，退化为全量审查")
 
     t0 = time.monotonic()
-    context = _context_fingerprint(args.issue_hint or "", root, run_dir)
-    builder = build_graph(client, second_client, cache, context=context)
+    builder = build_graph(client, second_client, cache)
     ckpt_path = run_dir / "checkpoints.sqlite"
 
     with SqliteSaver.from_conn_string(str(ckpt_path)) as saver:

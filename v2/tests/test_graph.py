@@ -104,6 +104,26 @@ def test_conditional_edge_skips_second_review(mini_project, tmp_path):
     assert all(d["second_verdict"] is None for d in saved)
 
 
+def test_syntax_error_file_yields_parse_finding(tmp_path):
+    (tmp_path / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    client = FakeClient()
+    _run(client, None, tmp_path, run_dir, thread_id="t-parse")
+
+    saved = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
+    parse = [d for d in saved if d["title"] == "语法解析失败"]
+    assert len(parse) == 1
+    f = parse[0]
+    assert f["category"] == "correctness"
+    assert f["severity"] == "critical"
+    assert f["file_path"] == "bad.py"
+    assert f["line_start"] == f["line_end"] >= 1
+    assert f["description"]  # 解析错误原文非空
+    # 语法错误文件不进 LLM（零请求）
+    assert client.total_requests == 0
+
+
 def test_resume_same_thread_id_no_extra_requests(mini_project, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

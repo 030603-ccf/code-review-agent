@@ -69,7 +69,9 @@ recall/precision against the quixbugs known-bug dataset.
 ## Configuration
 
 See `config.example.yaml`. Secrets are read from environment variables named by
-each profile's `api_key_env`; keys are never stored in the repo.
+each profile's `api_key_env`; keys are never stored in the repo. The `cloud`
+(DeepSeek) profile ships with `extra_body: {"thinking": {"type": "disabled"}}`
+already set — see tuning decision #1 below for why.
 
 ## Tuning decisions (why it's configured this way)
 
