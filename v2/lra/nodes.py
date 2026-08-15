@@ -20,7 +20,8 @@ from lra.agents.reviewer import review_chunk as do_review_chunk
 from lra.agents.rules import format_rules_injection, load_rules
 from lra.agents.second_reviewer import (MISTAKE_INJECT_LIMIT,
                                         load_mistakes_text,
-                                        second_review as do_second_review)
+                                        second_review as do_second_review,
+                                        write_mistakes)
 from lra.analysis.chunking import chunk_file
 from lra.analysis.dep_graph import build_dep_graph, format_dep_context
 from lra.analysis.lsp import collect_candidates, lsp_findings
@@ -361,7 +362,7 @@ class Nodes:
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=SECOND_REVIEW_WORKERS)
         try:
             futures = {ex.submit(do_second_review, items, state["root"],
-                                 self.second_client, None, mistakes_path): relpath
+                                 self.second_client, None): relpath
                        for relpath, items in by_file.items()}
             done, not_done = concurrent.futures.wait(futures,
                                                      timeout=SECOND_REVIEW_TIMEOUT)
@@ -379,9 +380,14 @@ class Nodes:
                 self._mark_uncertain(by_file[relpath], "终审超时")
                 all_out.extend(by_file[relpath])
         finally:
-            # shutdown(wait=False): don't block on timed-out threads — they
-            # finish on their own, bounded by httpx's timeout.
+            # shutdown(wait=False) 让超时线程继续后台跑直到 httpx timeout（≤120s）
+            # 结束，是有界泄漏；但其结果不进 findings（not_done 已标 uncertain），
+            # 且不再写错题本（已移到主线程 write_mistakes），所以无副作用。
             ex.shutdown(wait=False, cancel_futures=True)
+
+        # 错题本：只把 done（正常完成）里 rejected 的 finding 写进错题本；
+        # 超时线程不写（其结果不进 all_out，且 second_review 已不再内部写）。
+        write_mistakes(all_out, mistakes_path)
 
         all_out.sort(key=lambda f: f.id)
         save_path.write_text(

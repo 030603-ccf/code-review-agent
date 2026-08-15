@@ -179,7 +179,10 @@ def optimize_loop(run_dir, copy_root, findings, state, fixer,
 
     backend = getattr(fixer, "backend", "api")
     model = getattr(fixer, "model", "") or ""
-    remaining = {f.id for f in findings}
+    # 断点续跑：remaining 只含还没 verified 的 finding；已确认修好的跳过，
+    # 不再重复修。state.data["findings"] 是 {fid: {status, file, severity, title}}。
+    remaining = {f.id for f in findings
+                 if state.data["findings"].get(f.id, {}).get("status") != "verified"}
 
     for round_no in range(1, max_rounds + 1):
         # 防回归清单：已 verified 的 finding 提醒修改器别破坏

@@ -4,7 +4,10 @@ opencode failure handling, and loop stuck detection / fix cache.
 No network, no real opencode — fake clients and monkeypatched subprocess only.
 """
 
+import argparse
+import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -521,3 +524,202 @@ def test_loop_success_rounds(tmp_path):
     assert result["rounds"] == 1  # 一轮全清
     assert result["verified"] == ["F1"]
     assert st.findings_by_status("verified") == ["F1"]
+
+
+# ---------- 断点续跑 ----------
+
+def test_loop_resume_skips_verified_findings(tmp_path):
+    """断点续跑：上次已 verified 的 finding 不重修，只修 remaining。"""
+    copy_root = tmp_path / "copy"
+    (copy_root / "src").mkdir(parents=True)
+    (copy_root / "src" / "a.py").write_text("print('bad')\n", encoding="utf-8")
+    (copy_root / "src" / "b.py").write_text("print('bad')\n", encoding="utf-8")
+    findings = [
+        _finding(fid="F1", file_path="src/a.py"),
+        _finding(fid="F2", file_path="src/b.py"),
+    ]
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings(findings)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    # --- 首次跑：F1 修好 verified，F2 复查仍在 remaining（模拟中断点） ---
+    class Phase1Fixer:
+        backend = "api"
+        model = "fake-model"
+
+        def __init__(self, copy_root, state):
+            self.copy_root = copy_root
+
+        def apply(self, task):
+            (self.copy_root / task.file_path).write_text(
+                "print('fixed')\n", encoding="utf-8")
+            return True
+
+    class Phase1Client:
+        config = type("Cfg", (), {"model": "fake-model"})()
+
+        def chat(self, messages, **kwargs):
+            return ('{"verdicts": ['
+                    '{"finding_id": "F1", "still_exists": false, "reason": "gone"},'
+                    '{"finding_id": "F2", "still_exists": true, "reason": "still"}'
+                    ']}')
+
+    optimize_loop(run_dir, copy_root, findings, st,
+                  Phase1Fixer(copy_root, st), review_client=Phase1Client(),
+                  max_rounds=1)
+    assert st.data["findings"]["F1"]["status"] == "verified"
+    assert st.data["findings"]["F2"]["status"] == "remaining"
+
+    # 落盘状态，模拟进程中断重启
+    state_path = run_dir / "opt_state.json"
+    st.save(state_path)
+    st2 = OptState.load(state_path)
+
+    # --- 续跑：只修 F2 所在文件，F1 的文件不再被 fixer 触碰 ---
+    touched = []
+
+    class Phase2Fixer:
+        backend = "api"
+        model = "fake-model"
+
+        def __init__(self, copy_root, state):
+            self.copy_root = copy_root
+
+        def apply(self, task):
+            touched.append(task.file_path)
+            (self.copy_root / task.file_path).write_text(
+                "print('fixed2')\n", encoding="utf-8")
+            return True
+
+    class Phase2Client:
+        config = type("Cfg", (), {"model": "fake-model"})()
+
+        def chat(self, messages, **kwargs):
+            return ('{"verdicts": ['
+                    '{"finding_id": "F2", "still_exists": false, "reason": "gone"}'
+                    ']}')
+
+    optimize_loop(run_dir, copy_root, findings, st2,
+                  Phase2Fixer(copy_root, st2), review_client=Phase2Client(),
+                  max_rounds=1)
+    assert touched == ["src/b.py"]  # 只修 remaining 的文件，verified 的不重修
+    assert st2.data["findings"]["F1"]["status"] == "verified"
+    assert st2.data["findings"]["F2"]["status"] == "verified"
+    # F1 的文件内容没有被二次修改
+    assert (copy_root / "src" / "a.py").read_text(encoding="utf-8") == "print('fixed')\n"
+
+
+def test_cmd_optimize_resume_reuses_copy_and_state(tmp_path, monkeypatch):
+    """cmd_optimize 续跑分支：不重建副本、加载旧状态、传持久化 FixCache。"""
+    import lra.__main__ as main
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    findings = [_finding(fid="F1", file_path="src/a.py")]
+    (run_dir / "findings.json").write_text(
+        json.dumps([f.model_dump(mode="json") for f in findings],
+                   ensure_ascii=False), encoding="utf-8")
+
+    # 上次跑过：副本已存在，F1 已 verified
+    copy_root = run_dir / "optimized_copy"
+    (copy_root / "src").mkdir(parents=True)
+    (copy_root / "src" / "a.py").write_text("print('fixed')\n", encoding="utf-8")
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings(findings)
+    st.set_finding_status("F1", "verified", "done")
+    st.save(run_dir / "opt_state.json")
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_profile: x\nprofiles:\n  x:\n    model: m\n"
+        "    base_url: http://127.0.0.1\n", encoding="utf-8")
+
+    calls = {}
+
+    def fake_create_workspace(target_root, run_dir_):
+        calls["create_workspace"] = True
+        return Path(run_dir_) / "optimized_copy"
+
+    class FakeLLM:
+        @classmethod
+        def from_config(cls, path, profile=None):
+            return FakeClient()
+
+    def fake_make_fixer(**kwargs):
+        return type("F", (), {"backend": "api", "model": "fake-model"})()
+
+    def fake_optimize_loop(**kwargs):
+        calls["optimize_loop_kwargs"] = kwargs
+        return {"rounds": 0, "verified": [], "remaining": [], "failed": []}
+
+    monkeypatch.setattr(main, "create_workspace", fake_create_workspace)
+    monkeypatch.setattr(main, "LLMClient", FakeLLM)
+    monkeypatch.setattr(main, "make_fixer", fake_make_fixer)
+    monkeypatch.setattr(main, "optimize_loop", fake_optimize_loop)
+
+    args = argparse.Namespace(run_dir=str(run_dir), path=str(tmp_path),
+                              config=str(config_path), profile=None,
+                              backend=None, max_rounds=3, verify="llm",
+                              build_cmd="ruff check", issue_hint=None)
+    rc = main.cmd_optimize(args)
+    assert rc == 0
+    assert "create_workspace" not in calls  # 续跑不重建副本
+    kw = calls["optimize_loop_kwargs"]
+    assert kw["copy_root"] == run_dir / "optimized_copy"
+    assert kw["state"].data["findings"]["F1"]["status"] == "verified"
+    assert kw["cache"].path == run_dir / "fix_cache.json"
+
+
+def test_cmd_optimize_first_run_creates_workspace_and_registers(tmp_path, monkeypatch):
+    """cmd_optimize 首次分支：建副本、注册 findings（pending）、传持久化 FixCache。"""
+    import lra.__main__ as main
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    findings = [_finding(fid="F1", file_path="src/a.py")]
+    (run_dir / "findings.json").write_text(
+        json.dumps([f.model_dump(mode="json") for f in findings],
+                   ensure_ascii=False), encoding="utf-8")
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_profile: x\nprofiles:\n  x:\n    model: m\n"
+        "    base_url: http://127.0.0.1\n", encoding="utf-8")
+
+    calls = {}
+
+    def fake_create_workspace(target_root, run_dir_):
+        calls["create_workspace"] = True
+        p = Path(run_dir_) / "optimized_copy"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    class FakeLLM:
+        @classmethod
+        def from_config(cls, path, profile=None):
+            return FakeClient()
+
+    def fake_make_fixer(**kwargs):
+        return type("F", (), {"backend": "api", "model": "fake-model"})()
+
+    def fake_optimize_loop(**kwargs):
+        calls["optimize_loop_kwargs"] = kwargs
+        return {"rounds": 0, "verified": [], "remaining": [], "failed": []}
+
+    monkeypatch.setattr(main, "create_workspace", fake_create_workspace)
+    monkeypatch.setattr(main, "LLMClient", FakeLLM)
+    monkeypatch.setattr(main, "make_fixer", fake_make_fixer)
+    monkeypatch.setattr(main, "optimize_loop", fake_optimize_loop)
+
+    args = argparse.Namespace(run_dir=str(run_dir), path=str(tmp_path),
+                              config=str(config_path), profile=None,
+                              backend=None, max_rounds=3, verify="llm",
+                              build_cmd="ruff check", issue_hint=None)
+    rc = main.cmd_optimize(args)
+    assert rc == 0
+    assert calls["create_workspace"] is True  # 首次才建副本
+    kw = calls["optimize_loop_kwargs"]
+    assert kw["state"].data["findings"]["F1"]["status"] == "pending"
+    assert kw["cache"].path == run_dir / "fix_cache.json"
+    assert (run_dir / "opt_state.json").is_file()  # 首次已落盘

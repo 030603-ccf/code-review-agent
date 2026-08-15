@@ -23,7 +23,7 @@ from lra.graph import build_graph
 from lra.llm.client import LLMClient
 from lra.optimizer.copier import create_workspace, hash_tree
 from lra.optimizer.fixer import make_fixer
-from lra.optimizer.loop import optimize_loop
+from lra.optimizer.loop import FixCache, optimize_loop
 from lra.optimizer.opt_state import OptState
 from lra.schemas.finding import Finding
 
@@ -207,12 +207,22 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         print(f"线索模式   : {args.issue_hint}")
     print()
 
-    copy_root = create_workspace(target_root, run_dir)
-    print(f"副本已建立 : {copy_root}")
+    # 断点续跑：opt_state.json + optimized_copy/ 都在 = 上次已经跑过一轮，
+    # 复用副本与状态，不重建、不重装 findings，只从上次没 verified 的地方续修。
+    opt_state_path = run_dir / "opt_state.json"
+    copy_root = run_dir / "optimized_copy"
+    if opt_state_path.is_file() and copy_root.is_dir():
+        state = OptState.load(opt_state_path)
+        print("检测到上次修复状态，断点续跑")
+    else:
+        copy_root = create_workspace(target_root, run_dir)
+        print(f"副本已建立 : {copy_root}")
+        state = OptState(str(target_root), str(copy_root))
+        state.register_findings(findings)
+        state.save(opt_state_path)
 
-    state = OptState(str(target_root), str(copy_root))
-    state.register_findings(findings)
-    state.save(run_dir / "opt_state.json")
+    # 修复缓存落盘：断点续跑时命中上次已修好的文件，跳过 fixer 调用。
+    cache = FixCache(run_dir / "fix_cache.json")
 
     opencode_cfg = fixer_cfg.get("opencode", {})
     fixer = make_fixer(
@@ -231,7 +241,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         run_dir=run_dir, copy_root=copy_root, findings=findings, state=state,
         fixer=fixer, review_client=review_client, max_rounds=args.max_rounds,
         verify_mode=args.verify, build_cmd=build_cmd,
-        issue_hint=args.issue_hint or "", log=print,
+        issue_hint=args.issue_hint or "", cache=cache, log=print,
     )
     elapsed = time.monotonic() - t0
 

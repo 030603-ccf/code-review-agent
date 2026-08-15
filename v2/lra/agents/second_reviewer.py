@@ -75,9 +75,46 @@ def load_mistakes_text(path: str | Path | None,
         f"- {r.get('title', '')}（{r.get('reason', '')}）" for r in records)
 
 
+def write_mistakes(items: list[Finding],
+                   mistakes_path: str | Path | None) -> None:
+    """把被驳回（rejected）的 finding 追加进错题本 JSONL。
+
+    从 ``second_review`` 内部移出：超时线程的结果不进 findings，不应再写错题本，
+    改由主线程在收集完 done 的结果后统一调用本函数（只写 done 的 rejected）。
+    写前去重 + 进程内锁，语义与从前一致。
+    """
+    if mistakes_path is None:
+        return
+    path = Path(mistakes_path)
+    rejected = [f for f in items if f.second_verdict == "rejected"]
+    if not rejected:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _MISTAKES_LOCK:
+        existing = {(r.get("file"), r["title"])
+                    for r in _read_records(path) if r.get("title")}
+        seen: set[tuple] = set()
+        records: list[dict] = []
+        for f in rejected:
+            key = (f.file_path, f.title)
+            if key in existing or key in seen:
+                continue
+            seen.add(key)
+            records.append({
+                "title": f.title,
+                "reason": f.second_reason or "",
+                "category": f.category,
+                "file": f.file_path,
+                "evidence": f.evidence,
+            })
+        if records:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write("".join(
+                    json.dumps(r, ensure_ascii=False) + "\n" for r in records))
+
+
 def second_review(items: list[Finding], root, client,
-                  save_path: str | Path | None = None,
-                  mistakes_path: str | Path | None = None) -> list[Finding]:
+                  save_path: str | Path | None = None) -> list[Finding]:
     if not items:
         return items
 
@@ -109,35 +146,6 @@ def second_review(items: list[Finding], root, client,
             encoding="utf-8",
         )
 
-    # 错题本：被驳回的误报追加为 JSONL，供后续轮次提示模型不要再犯。
-    # 写前去重：相同 (file, title) 的条目（含本批内部重复）只写一次，防止无限膨胀。
-    # 不同文件的同 title 误报是不同样本，各自保留。
-    rejected = [f for f in items if f.second_verdict == "rejected"]
-    if rejected:
-        path = (Path(mistakes_path) if mistakes_path is not None
-                else (Path(save_path).parent / "mistakes.jsonl"
-                      if save_path is not None else None))
-        if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with _MISTAKES_LOCK:
-                existing = {(r.get("file"), r["title"])
-                            for r in _read_records(path) if r.get("title")}
-                seen: set[tuple] = set()
-                records: list[dict] = []
-                for f in rejected:
-                    key = (f.file_path, f.title)
-                    if key in existing or key in seen:
-                        continue
-                    seen.add(key)
-                    records.append({
-                        "title": f.title,
-                        "reason": f.second_reason or "",
-                        "category": f.category,
-                        "file": f.file_path,
-                        "evidence": f.evidence,
-                    })
-                if records:
-                    with path.open("a", encoding="utf-8") as fh:
-                        fh.write("".join(
-                            json.dumps(r, ensure_ascii=False) + "\n" for r in records))
+    # 错题本写入已移出到 write_mistakes()：由调用方（nodes.second_review 主线程）
+    # 统一把 done 的 rejected 写进错题本，超时线程不再写，消除假超时的副作用。
     return items
