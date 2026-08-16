@@ -1,176 +1,113 @@
-"""纯函数单元测试：不依赖图、不依赖模型，直接测编排层的小函数。
-
-覆盖对象（都是“输入 dict -> 输出 dict/列表”的纯逻辑，最好测的代码）：
-    - fan_out             发牌员：零块/有块/缺键 三态
-    - route_after_aggregate  条件边路由：配了终审/没配 两态
-    - classify_error      异常分类：瞬时 vs 永久
-    - _should_skip        文件过滤（阶段 5 的常量与函数）
-"""
-
-import sys
-from pathlib import Path
+"""Unit tests for pure functions: error classification, failed-block reducer,
+language normalization, and chunking."""
 
 import pytest
-from langgraph.types import Send
+from pydantic import ValidationError
 
-import lra
 from lra.errors import PermanentError, TransientError, classify_error
+from lra.nodes import _parse_error_findings, _parse_error_line
+from lra.schemas.finding import Finding
+from lra.state import _merge_failed
+from lra.tools import normalize_lang
+from lra.analysis.chunking import chunk_file
 
 
-# ==================== fan_out（graph.py）====================
-
-def test_fan_out_empty_work_returns_aggregate_string():
-    """零块：返回普通跳转 ["aggregate"]，图不悬空。"""
-    from lra.graph import fan_out
-    assert fan_out({"work": []}) == ["aggregate"]
-
-
-def test_fan_out_absent_work_key_returns_aggregate():
-    """work 键缺失（极端情况）：get 兜底，同样返回 ["aggregate"]。"""
-    from lra.graph import fan_out
-    assert fan_out({}) == ["aggregate"]
+def test_classify_error_passthrough():
+    t = TransientError("x")
+    assert classify_error(t) is t
+    p = PermanentError("x")
+    assert classify_error(p) is p
 
 
-def test_fan_out_with_work_returns_sends():
-    """有块：每块一张 Send 工单，包裹里带 entry/chunk/run_dir。"""
-    from lra.graph import fan_out
-    work = [
-        {"entry": {"relpath": "a.py"}, "chunk": {"file": "a.py",
-                                                 "line_start": 1}},
-        {"entry": {"relpath": "b.py"}, "chunk": {"file": "b.py",
-                                                 "line_start": 5}},
+def test_classify_error_builtin_timeout():
+    assert isinstance(classify_error(TimeoutError("t")), TransientError)
+    assert isinstance(classify_error(ConnectionError("c")), TransientError)
+
+
+def test_classify_error_generic_is_permanent():
+    assert isinstance(classify_error(ValueError("v")), PermanentError)
+
+
+def test_merge_failed_dedupes_and_resolves():
+    a = [{"entry": {"relpath": "x.py"}, "chunk": {"line_start": 1, "line_end": 3},
+          "error": "boom"}]
+    b = [{"entry": {"relpath": "x.py"}, "chunk": {"line_start": 1, "line_end": 3},
+          "error": "boom"}]
+    assert len(_merge_failed(a, b)) == 1  # dedupe
+
+    resolved = [{"entry": {"relpath": "x.py"}, "chunk": {"line_start": 1, "line_end": 3},
+                 "resolved": True}]
+    assert _merge_failed(a, resolved) == []  # resolved removes the identity
+
+
+def test_normalize_lang():
+    assert normalize_lang("a.py", "") == "python"
+    assert normalize_lang("A.java", "") == "java"
+    assert normalize_lang("a.js", "") == "javascript"
+    assert normalize_lang("a.ts", "") == "javascript"
+    assert normalize_lang("a.txt", "") == ""
+
+
+def test_chunk_small_file_one_chunk():
+    entry = {"relpath": "x.py", "symbols": []}
+    content = "a = 1\nb = 2\n"
+    chunks = chunk_file(entry, content)
+    assert len(chunks) == 1
+    assert chunks[0]["line_start"] == 1 and chunks[0]["line_end"] == 2
+    assert "1: a = 1" in chunks[0]["text"]
+
+
+def test_chunk_large_file_multiple_chunks():
+    entry = {"relpath": "x.py", "symbols": []}
+    content = "\n".join(f"line_{i} = {i}" for i in range(1000))
+    chunks = chunk_file(entry, content, max_chars=2000)
+    assert len(chunks) > 1
+    # chunks are contiguous and non-overlapping at the line level in window mode
+    assert chunks[0]["line_start"] == 1
+
+
+def _finding(category):
+    return Finding(id="F1", category=category, severity="high",
+                   file_path="a.py", line_start=1, line_end=1,
+                   title="t", description="d", evidence="e",
+                   suggestion="s", confidence=0.9)
+
+
+def test_finding_accepts_correctness_category():
+    assert _finding("correctness").category == "correctness"
+    # 原有四类不受影响
+    for c in ("security", "performance", "readability", "best_practice"):
+        assert _finding(c).category == c
+
+
+def test_finding_rejects_unknown_category():
+    with pytest.raises(ValidationError):
+        _finding("nonsense")
+
+
+def test_parse_error_line_extracts_number():
+    assert _parse_error_line("invalid syntax (line 3)") == 3
+    assert _parse_error_line("expected ':' (line 12)") == 12
+
+
+def test_parse_error_line_falls_back_to_one():
+    assert _parse_error_line("unexpected EOF while parsing") == 1
+    assert _parse_error_line("") == 1
+
+
+def test_parse_error_findings_builds_correctness():
+    files = [
+        {"relpath": "bad.py", "parse_error": "invalid syntax (line 3)"},
+        {"relpath": "ok.py", "parse_error": None},
     ]
-    result = fan_out({"work": work, "run_dir": "runs/x"})
-    assert len(result) == 2
-    assert all(isinstance(s, Send) for s in result)
-    # 包裹原样透传，还附带 run_dir（并行分支写日志要用）
-    assert result[0].arg["entry"] == work[0]["entry"]
-    assert result[0].arg["chunk"] == work[0]["chunk"]
-    assert result[0].arg["run_dir"] == "runs/x"
-
-
-# ==================== route_after_aggregate（graph.py）====================
-
-def test_route_after_aggregate_with_judge():
-    """配了终审模型 -> 走 second_review。"""
-    from lra.graph import make_route_after_aggregate
-    route = make_route_after_aggregate(second_client=object())
-    assert route({"aggregated": []}) == "second_review"
-
-
-def test_route_after_aggregate_without_judge():
-    """没配终审模型 -> 直达 report。"""
-    from lra.graph import make_route_after_aggregate
-    route = make_route_after_aggregate(second_client=None)
-    assert route({"aggregated": []}) == "report"
-
-
-# ==================== fan_out_failed（graph.py，失败块补跑路由）====================
-
-def _fake_failed_block():
-    return [{"entry": {"relpath": "a.py"},
-             "chunk": {"file": "a.py", "line_start": 1},
-             "error": "APIError: 欠费"}]
-
-
-def test_fan_out_failed_has_failed_blocks_sends_retry():
-    """有失败块且轮次未满 -> 派发 retry_failed 补跑（Send 工单）。"""
-    from lra.graph import fan_out_failed
-    result = fan_out_failed({"failed_blocks": _fake_failed_block(),
-                             "retry_round": 0})
-    assert len(result) == 1
-    assert isinstance(result[0], Send)
-    assert result[0].node == "retry_failed"
-    assert result[0].arg["round"] == 0
-
-
-def test_fan_out_failed_round_limit_reached_goes_report():
-    """轮数到上限 -> 不再补跑，直达 report（防无限循环）。"""
-    from lra.graph import fan_out_failed
-    result = fan_out_failed({"failed_blocks": _fake_failed_block(),
-                             "retry_round": 1})
-    assert result == ["report"]
-
-
-def test_fan_out_failed_no_failed_blocks_with_judge():
-    """无失败块 + 配了终审 -> 走 second_review。"""
-    from lra.graph import fan_out_failed
-    result = fan_out_failed({"failed_blocks": [], "retry_round": 0,
-                             "second_client_enabled": True})
-    assert result == ["second_review"]
-
-
-def test_fan_out_failed_no_failed_blocks_without_judge():
-    """无失败块 + 没配终审 -> 直达 report。"""
-    from lra.graph import fan_out_failed
-    result = fan_out_failed({"failed_blocks": [], "retry_round": 0,
-                             "second_client_enabled": False})
-    assert result == ["report"]
-
-
-# ==================== 402 欠费可重试（errors.py）====================
-
-def test_classify_402_insufficient_balance_is_transient():
-    """402 余额不足归为瞬时错误：充值后重试能成功，不该永久放弃。"""
-    from cra.llm.client import APIError
-    from lra.errors import classify_error, TransientError
-
-    class _R:
-        status_code = 402
-
-    err = APIError("HTTP 402: Insufficient Balance")
-    err.response = _R()
-    assert isinstance(classify_error(err), TransientError)
-
-
-# ==================== classify_error（errors.py）====================
-
-class _FakeResponse:
-    def __init__(self, status_code, headers=None):
-        self.status_code = status_code
-        self.headers = headers or {}
-
-
-class _FakeHTTPError(Exception):
-    def __init__(self, response):
-        super().__init__(f"HTTP {response.status_code}")
-        self.response = response
-
-
-def test_classify_timeout_name_is_transient():
-    """类型名带 Timeout（httpx.TimeoutException 等）-> 瞬时。"""
-    assert isinstance(classify_error(TimeoutError("慢死了")), TransientError)
-
-
-def test_classify_connection_error_is_transient():
-    """内建 ConnectionError -> 瞬时。"""
-    assert isinstance(classify_error(ConnectionError("连不上")), TransientError)
-
-
-def test_classify_429_is_transient():
-    """HTTP 429（速率限制）-> 瞬时。"""
-    err = _FakeHTTPError(_FakeResponse(429))
-    assert isinstance(classify_error(err), TransientError)
-
-
-def test_classify_503_is_transient():
-    """HTTP 503（服务不可用）-> 瞬时。"""
-    err = _FakeHTTPError(_FakeResponse(503))
-    assert isinstance(classify_error(err), TransientError)
-
-
-def test_classify_400_is_permanent():
-    """HTTP 400（请求本身有错）-> 永久。"""
-    err = _FakeHTTPError(_FakeResponse(400))
-    assert isinstance(classify_error(err), PermanentError)
-
-
-def test_classify_value_error_is_permanent():
-    """普通异常（ValueError 等）-> 永久。"""
-    assert isinstance(classify_error(ValueError("坏的输出")), PermanentError)
-
-
-def test_classify_own_transient_error_passes_through():
-    """lra 自己的 TransientError 原样放行，不会被误判成永久。"""
-    err = classify_error(TransientError("超时了"))
-    assert isinstance(err, TransientError)
+    out = _parse_error_findings(files)
+    assert len(out) == 1
+    f = out[0]
+    assert f.category == "correctness"
+    assert f.severity == "critical"
+    assert f.file_path == "bad.py"
+    assert (f.line_start, f.line_end) == (3, 3)
+    assert f.title == "语法解析失败"
+    assert f.description == "invalid syntax (line 3)"
+    assert f.evidence == ""
+    assert f.confidence == 1.0

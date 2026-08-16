@@ -1,455 +1,431 @@
-"""nodes.py —— 六个节点的薄封装。
+"""Node implementations. Thin wrappers: pull from state, call a deterministic
+module, return a state update. LLM clients live on the Nodes instance, not in
+state (state must serialize into SQLite; clients cannot).
 
-"薄封装"是什么意思：
-    节点函数里**没有业务逻辑**，只有三件事：
-      1. 从 State（工作台）取材料
-      2. 调用 cra 里对应的确定性函数干活
-      3. 把成果写成 dict 返回（框架负责放回工作台）
-
-    对照原版 pipeline.py：那里每个"状态"是 _run() 函数里的一段代码块；
-    这里每段代码块升级成了独立函数——因为 LangGraph 的节点必须是
-    "接收 state、返回 state 更新"的可调用对象。
-
-为什么把节点收进一个 Nodes 类：
-    LLMClient 对象（带连接、带 token 计数）**不能放进 State**——
-    checkpoint 要把 State 序列化进 SQLite，client 序列化不了。
-    所以让 Nodes 实例用 self.client 持有它（这叫**闭包/依赖注入**：
-    图在编译前把依赖"缝"进节点函数里），State 里只留纯数据。
-    这是用 LangGraph 时最常见的姿势，记住它。
-
-进度展示的去处：
-    原版用 EventBus + RunState 记进度（为了 Web 端的 SSE 推送）。
-    这个重写版聚焦编排层本身，进度直接 print——
-    想接回 EventBus 的话，在节点里加一行 emit 就行，cra 的 EventBus
-    同样可以原样复用。
+Timeout policy (deliberate): there is NO node-level wall-clock timeout wrapping
+the LLM call. Python cannot kill a running thread, so a ThreadPoolExecutor
+wrapper would only *pretend* to time out — its `with` block blocks on shutdown
+anyway. The real timeout is httpx's per-request timeout inside the client; on
+top of it we retry transient errors with exponential backoff.
 """
 
 import concurrent.futures
 import json
+import re
 import time
 from pathlib import Path
 
-# 确定性模块原样复用：import 时起别名（as cra_xxx），
-# 一是避免和本类的方法名撞车，二是让读者一眼看出"这是借来的车"
-from cra.agents.aggregator import aggregate as cra_aggregate
-from cra.analysis.dep_graph import build_dep_graph, format_dep_context
-from cra.agents.rules import load_rules, format_rules_injection
-from cra.agents.reviewer import review_chunk as cra_review_chunk
-from cra.agents.second_reviewer import second_review as cra_second_review
-from cra.analysis.ast_scan import scan_project
-from cra.analysis.chunking import chunk_file
-from cra.memory.project_map import brief, save_project_map
-from cra.report.markdown import render_report
-from cra.schemas.finding import Finding
-
-from lra.errors import PermanentError, TransientError, classify_error
+from lra.agents.aggregator import aggregate as do_aggregate
+from lra.agents.reviewer import review_chunk as do_review_chunk
+from lra.agents.rules import format_rules_injection, load_rules
+from lra.agents.second_reviewer import (MISTAKE_INJECT_LIMIT,
+                                        load_mistakes_text,
+                                        second_review as do_second_review,
+                                        write_mistakes)
+from lra.analysis.chunking import chunk_file
+from lra.analysis.dep_graph import build_dep_graph, format_dep_context
+from lra.analysis.lsp import collect_candidates, lsp_findings
+from lra.analysis.scan import scan_project
+from lra.errors import PermanentError, classify_error
+from lra.ignore import path_is_ignored
 from lra.logger import NodeLogger
-from lra.state import ReviewState
+from lra.report.markdown import render_report
+from lra.schemas.finding import Finding
 from lra.tools import scan_anti_patterns, scan_security
 
-# ---- 单块审查的容错参数（节点级，见 review_chunk 的注释）----
-MAX_RETRIES = 5            # 瞬时错误最多重试 5 次（算上首试共 6 次机会）
-BASE_DELAY = 2.0           # 指数退避基数：2s, 4s, 8s, 16s, 32s（限流后给 API 喘息时间）
-REVIEW_TIMEOUT_SEC = 120   # 单次审查调用的超时上限（限流期单次调用可达 100s+，90s 会误杀；120s 兼顾容忍与不无限等）
-MAX_RETRY_ROUNDS = 1       # 失败块的补跑轮数上限：aggregate 后统一再试一轮，仍失败就进报告
-SECOND_REVIEW_WORKERS = 8  # 终审并行度（与初审不同：不受框架 max_concurrency 管，由线程池控制）
+MAX_RETRIES = 5
+BASE_DELAY = 2.0
+MAX_RETRY_ROUNDS = 1
+SECOND_REVIEW_WORKERS = 8
+SECOND_REVIEW_TIMEOUT = 120.0
 
-# ---- 文件过滤（chunk 节点用）：这些文件不切块、不审查 ----
-# 两层判据：
-#   SKIP_DIR_PARTS  路径里任意一段命中即跳过（生成物/依赖/元数据目录）
-#   SKIP_GLOBS      文件名模式命中即跳过（压缩产物/生成代码）
-SKIP_DIR_PARTS = {
-    "node_modules", ".git", ".hg", ".svn", "__pycache__",
-    ".venv", "venv", "env", "dist", "build", "out", "target",
-    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".idea", ".vscode",
-    "vendor", "third_party", "thirdparty", "site-packages", ".tox",
-}
+# 文件级过滤（按文件名 glob），目录级过滤统一走 lra.ignore。
 SKIP_GLOBS = ("*.min.js", "*.min.css", "*.min.js.map", "*.pb.go",
               "*.generated.*", "*.pb.cc", "*.pb.h", "*.lock")
 
 
 def _should_skip(relpath: str) -> bool:
-    """判断文件是否应跳过审查（返回 True = 跳过）。
-
-    relpath 是项目内相对路径（正斜杠/反斜杠都可能），
-    切段时用 Path(relpath).parts 统一处理跨平台分隔符。
-    """
     import fnmatch
-    if any(part in SKIP_DIR_PARTS for part in Path(relpath).parts):
+    if path_is_ignored(Path(relpath).parts):
         return True
     fname = Path(relpath).name
-    if any(fnmatch.fnmatch(fname, pat) for pat in SKIP_GLOBS):
-        return True
-    return False
+    return any(fnmatch.fnmatch(fname, pat) for pat in SKIP_GLOBS)
 
 
-def _review_with_timeout(client, entry: dict, chunk: dict,
-                         timeout_sec: float = REVIEW_TIMEOUT_SEC) -> list:
-    """带超时的单块审查：把同步调用丢进单线程池，超时就报 TransientError。
+def _parse_error_line(msg: str) -> int:
+    """Extract the failing line number from scan's parse_error string.
 
-    为什么用线程池而不是简单的调用：
-        cra 的 LLMClient 用的是 httpx，自带 timeout（config 里 120s），
-        但那是"单次 HTTP 请求"的超时。这里管的是**节点级**的墙钟时间——
-        万一客户端内部重试把单次调用拖到几分钟，节点不能无限等下去。
-
-    超时之后线程还在后台跑（拦不住），但我们这边先返回 TransientError，
-    由调用方决定重试——旧的请求结果即使回来也不会被采用。
+    scan_file formats it as ``f"{e.msg} (line {e.lineno})"``; fall back to 1
+    when the line number cannot be parsed.
     """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(cra_review_chunk, client, entry, chunk)
-        try:
-            return fut.result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError:
-            raise TransientError(
-                f"审查超时（>{timeout_sec:.0f}s）")  # 不设 retry_after_sec，走指数退避
+    m = re.search(r"\(line (\d+)\)", msg or "")
+    return int(m.group(1)) if m else 1
 
 
-def _failed_block(payload: dict, err_type: str, err_msg: str) -> list[dict]:
-    """把一块失败登记进 failed_blocks 账本（供 fan_out_failed 补跑）。"""
-    return [{
-        "entry": payload["entry"],
-        "chunk": payload["chunk"],
-        "error": f"{err_type}: {err_msg[:200]}",
-    }]
+def _parse_error_findings(files: list[dict]) -> list[Finding]:
+    """Deterministic correctness findings for files that failed to parse.
+
+    These files are skipped in the chunk node (never sent to the LLM); without
+    this they would vanish from the report entirely. Zero LLM — built straight
+    from scan's ``parse_error`` field.
+    """
+    out: list[Finding] = []
+    for entry in files:
+        msg = entry.get("parse_error")
+        if not msg:
+            continue
+        line = _parse_error_line(str(msg))
+        out.append(Finding(
+            id="",
+            category="correctness",
+            severity="critical",
+            file_path=entry["relpath"],
+            line_start=line,
+            line_end=line,
+            title="语法解析失败",
+            description=str(msg),
+            evidence="",
+            suggestion="修复语法错误后重新审查",
+            confidence=1.0,
+        ))
+    return out
+
+
+def _incremental_filter(files: list[dict], diff_set: set[str]) -> list[dict]:
+    """增量模式下只保留变更文件；全量模式（diff_set 为空）原样返回全部。
+
+    parse_error 与 LSP 确定性诊断在 aggregate 节点注入，不看 diff_files 就会
+    打破 ``--incremental`` 只审变更文件的承诺。这里统一按 relpath 过滤。
+    """
+    if not diff_set:
+        return files
+    return [f for f in files if f.get("relpath") in diff_set]
 
 
 class Nodes:
-    """六个节点函数的集合，持有两个 LLM client（初审 + 可选的终审）。"""
-
-    def __init__(self, client, second_client=None):
-        self.client = client                  # 初审模型（本地 14B/7B）
-        # 终审模型；None = 不启用二级审查（对应原版 pipeline 的 second_client）
+    def __init__(self, client, second_client=None, cache=None, context="",
+                 lsp_cfg=None):
+        self.client = client
         self.second_client = second_client
+        self.cache = cache  # FindingCache | None；None=禁用
+        # 缓存键的输入指纹：--issue-hint + rules.json + 错题本 的 sha256 前 16 位。
+        # 这些输入影响 reviewer 输出却不体现在文件 sha1 里，必须拼进缓存键。
+        self.context = context
+        # LSP 确定性诊断配置（config 的 lsp 节）；None/未启用=不跑。
+        self.lsp_cfg = lsp_cfg or {}
 
-    # ==================== 节点 1：scan ====================
-
-    def scan(self, state: ReviewState) -> dict:
-        """静态扫描建索引（零 LLM）。对应原版 _run() 的 SCAN 段。"""
+    # ---- scan ----
+    def scan(self, state: dict) -> dict:
         logger = NodeLogger(state["run_dir"], "scan")
         logger.start()
         pm = scan_project(state["root"])
-        # 产物落盘：project_map.json 文件名与原版保持一致
-        save_project_map(pm, Path(state["run_dir"]) / "project_map.json")
-        logger.done(files=pm["file_count"], brief=brief(pm))
-        # 返回的 dict 会被框架合并进 State：pm 同时上了工作台
-        return {"project_map": pm}
+        (Path(state["run_dir"]) / "project_map.json").write_text(
+            json.dumps(pm, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 错题本：run_dir 上级 memory/mistakes.jsonl（跨 run 共享），
+        # 注入 state 供 review_chunk 提醒模型别重复误报；只取最近 N 条，
+        # 防止长期运行下错题本无限膨胀、每个 chunk 的 prompt 越来越贵。
+        mistakes_text = load_mistakes_text(
+            Path(state["run_dir"]).parent / "memory" / "mistakes.jsonl",
+            limit=MISTAKE_INJECT_LIMIT)
+        logger.done(files=pm["file_count"])
+        return {"project_map": pm, "mistakes_text": mistakes_text}
 
-    # ==================== 节点 2：chunk ====================
-
-    def chunk(self, state: ReviewState) -> dict:
-        """沿符号边界切块（零 LLM）。对应原版 _run() 的 CHUNK 段。
-
-        这里叠加了两道 lra 自有的过滤（cra 的 scan 不管这些）：
-            1. 文件过滤：node_modules / *.min.js 等不切块（_should_skip）
-            2. 增量模式：--incremental 时只切 git diff 变更的文件（diff_files）
-        """
+    # ---- chunk ----
+    def chunk(self, state: dict) -> dict:
         logger = NodeLogger(state["run_dir"], "chunk")
         logger.start()
         root = Path(state["root"])
         pm = state["project_map"]
-        diff_set = set(state.get("diff_files") or [])   # 增量模式的变更清单
+        diff_set = set(state.get("diff_files") or [])
         work: list[dict] = []
         for entry in pm["files"]:
             relpath = entry["relpath"]
             if _should_skip(relpath):
-                logger.skip(f"跳过 {relpath}（匹配跳过规则）")
                 continue
             if diff_set and relpath not in diff_set:
-                logger.skip(f"跳过 {relpath}（未变更，增量模式）")
                 continue
             if entry.get("parse_error"):
-                # 语法错误的文件不炸：记下来，跳过（原版同款行为）
-                logger.skip(f"跳过 {relpath}"
-                            f"（语法错误：{entry['parse_error']}）")
                 continue
-            content = (root / relpath).read_text(
-                encoding="utf-8", errors="replace")
+            content = (root / relpath).read_text(encoding="utf-8", errors="replace")
             for c in chunk_file(entry, content):
                 work.append({"entry": entry, "chunk": c})
-        logger.done(files=len(pm["files"]), chunks=len(work),
-                    diff_only=bool(diff_set))
 
-        # ---------- 跨文件依赖图（零 LLM） ----------
-        # 在切块后构建依赖图，为每个 entry 注入 dep_context
-        file_contents = {}
-        for entry in pm["files"]:
-            rp = entry["relpath"]
-            if not _should_skip(rp):
-                try:
-                    file_contents[rp] = (root / rp).read_text(
-                        encoding="utf-8", errors="replace")
-                except OSError:
-                    pass
-        dep_graph = build_dep_graph(pm, file_contents)
-        for w in work:
-            rel = w["entry"]["relpath"]
-            ctx = format_dep_context(rel, dep_graph, pm)
-            if ctx:
-                w["entry"]["_dep_context"] = ctx
-
-        # ---------- 规则注入（参考 OCR 的 glob 规则匹配） ----------
-        rules = load_rules(state["root"])
+        # 项目规则注入：.codereview/rules.json 中匹配该文件的规则 → _rules_text
+        rules = load_rules(root)
         if rules:
             for w in work:
-                rel = w["entry"]["relpath"]
-                rules_text = format_rules_injection(rel, rules)
+                rules_text = format_rules_injection(w["entry"]["relpath"], rules)
                 if rules_text:
                     w["entry"]["_rules_text"] = rules_text
 
+        # 跨文件依赖图（零 LLM）：注入 _dep_context，让 reviewer 看到依赖关系
+        file_contents: dict[str, str] = {}
+        for entry in pm["files"]:
+            rp = entry["relpath"]
+            if _should_skip(rp):
+                continue
+            try:
+                file_contents[rp] = (root / rp).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        try:
+            dep_graph = build_dep_graph(pm, file_contents)
+            for w in work:
+                ctx = format_dep_context(w["entry"]["relpath"], dep_graph, pm)
+                if ctx:
+                    w["entry"]["_dep_context"] = ctx
+        except Exception:
+            pass  # 依赖图是增强项，失败不影响主流程
+
+        # LSP 候选问题（warning/info/hint，需 LLM 验证）：按语言分组一次
+        # spawn 服务器、一次遍历该语言所有文件，结果塞进 entry，该文件的每个
+        # chunk 复用同一份候选文本。避免旧实现每文件 spawn 一次服务器串行
+        # 白等冷启动。没配服务器/启动失败在函数内部静默跳过。
+        if self.lsp_cfg.get("enabled"):
+            unique_entries: dict[str, dict] = {}
+            for w in work:
+                relpath = w["entry"].get("relpath", "")
+                if relpath and relpath not in unique_entries:
+                    unique_entries[relpath] = w["entry"]
+            try:
+                candidates = collect_candidates(
+                    root, list(unique_entries.values()), self.lsp_cfg)
+            except Exception:
+                candidates = {}  # LSP 候选是增强项，失败不影响主流程
+            for relpath, text in candidates.items():
+                unique_entries[relpath]["_lsp_candidates"] = text
+
+        logger.done(files=len(pm["files"]), chunks=len(work), diff_only=bool(diff_set))
         return {"work": work}
 
-    # ==================== 节点 3：review_chunk（并行扇出的工人）====================
-
+    # ---- review_chunk (parallel fan-out worker) ----
     def review_chunk(self, payload: dict) -> dict:
-        """审查一个代码块。这个节点会被 Send **并行派发**很多次——
-        每块一次，互不干扰。对应原版 _run() 里的 worker() 协程。
-
-        原版的一句注释在这里依然成立，而且被框架放大了：
-        "单块失败不拖垮整个 run：记录并继续——编排器的韧性设计。"
-
-        payload 里除了 entry/chunk，还带着 run_dir（fan_out 塞进来的），
-        这样每个并行分支都能写自己的结构化日志。
-
-        用户线索（issue_hint）的注入走方案 B：不碰 cra_review_chunk 的
-        调用签名，而是把线索写进 entry 字典的 "_issue_hint" 键，由
-        cra 的 review_chunk 自己读取追加（见 cra/agents/reviewer.py）。
-        注意同一文件的多个 chunk 可能共享同一个 entry dict，但这里的
-        赋值是幂等的（每次写同一个字符串），并行分支互相覆盖也无所谓。
-        """
         chunk = payload["chunk"]
         entry = payload["entry"]
         tag = f"{chunk['file']}:{chunk['line_start']}-{chunk['line_end']}"
         logger = NodeLogger(payload.get("run_dir", ""), "review_chunk")
         logger.start(tag=tag)
 
-        # ---- 用户线索：有线索才往 entry 里塞，没有就什么都不做 ----
-        issue_hint = payload.get("issue_hint", "")
-        if issue_hint:
-            entry["_issue_hint"] = issue_hint
+        hint = payload.get("issue_hint", "")
+        if hint:
+            entry["_issue_hint"] = hint
+        mistakes_text = payload.get("mistakes_text", "")
 
-        # ---- 零 LLM 确定性扫描：安全模式 + 语言反模式 ----
-        # 不烧 token，用正则检测已知问题，生成的 dict 格式与 LLM 发现一致
+        # sha1 增量缓存：文件内容未变 + 行区间相同的 chunk 直接复用上次 findings，
+        # 跳过工具扫描和 LLM（aggregate 仍会重新定位 evidence 行号）。
+        # 键含模型名：换模型后旧缓存不命中。
+        relpath = entry.get("relpath") or chunk.get("file", "")
+        sha1 = entry.get("sha1", "")
+        model = self.client.config.model
+        if self.cache is not None:
+            cached = self.cache.get(relpath, sha1,
+                                    chunk["line_start"], chunk["line_end"], model,
+                                    context=self.context)
+            if cached is not None:
+                logger.done(tag=tag + "（缓存命中）", findings=len(cached))
+                return {"findings": cached}
+
+        file = chunk.get("file", "")
+        lang = file.rsplit(".", 1)[-1] if "." in file else ""
         content = chunk.get("text", "")
-        lang = chunk.get("file", "").rsplit(".", 1)[-1] if "." in chunk.get("file", "") else ""
-        tool_findings = scan_security(entry.get("relpath", chunk.get("file", "")), content, lang)
-        tool_findings += scan_anti_patterns(entry.get("relpath", chunk.get("file", "")), content, lang)
-        if tool_findings:
-            logger.done(tag=tag + "（工）", findings=len(tool_findings), attempt=0, tokens=0)
+        tool_findings = scan_security(entry.get("relpath", file), content, lang)
+        tool_findings += scan_anti_patterns(entry.get("relpath", file), content, lang)
 
-        # 容错策略（比原版多一层分类）：
-        #   TransientError（网络抖动/超时/429）→ 指数退避重试，最多 MAX_RETRIES 次
-        #   PermanentError（模型输出不可修复等）→ 不重试，直接放弃
-        # 无论哪种，最终都返回 [] 而不是抛异常——单块失败不拖垮整个 run
-        # 这道防线框架不替你做（它默认节点异常会中断整张图），必须自己留
         last_err: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             try:
-                fs = _review_with_timeout(self.client,
-                                          payload["entry"], chunk)
+                fs = do_review_chunk(self.client, entry, chunk,
+                                     mistakes_text=mistakes_text)
             except Exception as e:
-                # 统一分类：_review_with_timeout 抛的 TransientError 也会
-                # 被 classify_error 原样放行（errors.py 第 0 条判据）
                 last_err = e
                 err = classify_error(e)
                 if isinstance(err, PermanentError):
-                    # 永久错误：不重试，直接放弃（工具发现还在）。
-                    # 也不登记补跑——烂 JSON/401 这类重跑一百次也一样，
-                    # 补跑只救得回瞬时错误（限流/欠费，见 errors.py 的 402）
                     logger.fail(f"{tag} 永久错误：{type(e).__name__}: {e}")
+                    # 永久错误也缓存（存工具发现）：重复跑时跳过 LLM 不再重试，
+                    # 避免每次对同一个 JSON 输出失败的文件白烧 token。
+                    if self.cache is not None:
+                        self.cache.put(relpath, sha1,
+                                       chunk["line_start"], chunk["line_end"],
+                                       tool_findings, model, context=self.context)
                     return {"findings": tool_findings}
                 if attempt >= MAX_RETRIES:
-                    break    # 瞬时错误但重试耗尽，落到最后的 fail 分支
-                delay = (err.retry_after_sec if err.retry_after_sec
-                         else BASE_DELAY * 2 ** attempt)
-                logger.skip(f"{tag} 瞬时错误（{type(e).__name__}），"
-                            f"{delay:.0f}s 后第 {attempt + 1} 次重试")
+                    break
+                delay = err.retry_after_sec if err.retry_after_sec else BASE_DELAY * 2 ** attempt
                 time.sleep(delay)
                 continue
-            # 成功：工具发现 + LLM 发现一起交卷
             all_findings = tool_findings + [f.model_dump(mode="json") for f in fs]
-            logger.done(tag=tag, findings=len(all_findings), attempt=attempt + 1,
-                        tool=len(tool_findings), llm=len(fs),
-                        tokens=self.client.total_tokens_used)
+            if self.cache is not None:
+                self.cache.put(relpath, sha1,
+                               chunk["line_start"], chunk["line_end"],
+                               all_findings, model, context=self.context)
+            logger.done(tag=tag, findings=len(all_findings),
+                        tool=len(tool_findings), llm=len(fs))
             return {"findings": all_findings}
 
-        logger.fail(f"{tag} 失败（重试耗尽）："
-                    f"{type(last_err).__name__}: {last_err}"
-                    if last_err else f"{tag} 失败")
+        logger.fail(f"{tag} 失败（重试耗尽）：{type(last_err).__name__}: {last_err}")
         return {"findings": tool_findings,
-                "failed_blocks": _failed_block(
-                    payload, type(last_err).__name__ if last_err else "unknown",
-                    str(last_err) if last_err else "")}
+                "failed_blocks": [{"entry": entry, "chunk": chunk,
+                                   "error": f"{type(last_err).__name__}: {str(last_err)[:200]}"}]}
 
-    # ==================== 节点 4：aggregate ====================
-
-    def aggregate(self, state: ReviewState) -> dict:
-        """证据校验 + 去重 + 重排 id（零 LLM）。对应原版 AGGREGATE 段。
-
-        框架保证：所有 review_chunk 分支都跑完，这个节点才会被触发——
-        这就是 map-reduce 里的 reduce 汇合点。原版靠
-        `await asyncio.gather(...)` 等所有人回来，现在靠图的拓扑保证。
-        """
-        logger = NodeLogger(state["run_dir"], "aggregate")
-        logger.start()
-        # state.get("findings", [])：极端情况（全部块失败/零块）时
-        # 收纳盒是空的，get 给默认值而不是 KeyError
-        findings = [Finding(**d) for d in state.get("findings", [])]
-        out = cra_aggregate(findings, state["root"])
-        # 落盘 findings.json（与原版同名同格式）
-        (Path(state["run_dir"]) / "findings.json").write_text(
-            json.dumps([f.model_dump(mode="json") for f in out],
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.done(raw=len(findings), after_qc=len(out))
-        return {"aggregated": [f.model_dump(mode="json") for f in out]}
-
-    # ==================== 节点 4.5：retry_failed（失败块补跑）====================
-
+    # ---- retry_failed ----
     def retry_failed(self, payload: dict) -> dict:
-        """补跑失败块：fan_out_failed 发的牌，逻辑与 review_chunk 一致。
-
-        场景：第一轮因限流/欠费/超时失败的块，在这里拿到第二次机会。
-        充值后同 thread-id 续跑（或 --retry-failed 倒带）会走到这里。
-
-        与 review_chunk 的区别：
-          - 不再登记 failed_blocks（账本只增不清，旧记录还在）
-          - 必须返回 retry_round+1（普通覆盖字段），fan_out_failed
-            靠它判断轮数上限，否则图上会无限循环
-        """
         chunk = payload["chunk"]
         entry = payload["entry"]
         tag = f"{chunk['file']}:{chunk['line_start']}-{chunk['line_end']}"
         logger = NodeLogger(payload.get("run_dir", ""), "retry_failed")
         logger.start(tag=tag)
 
-        # 与 review_chunk 相同的退避重试（充值期间的重试会自然成功）
         last_err: Exception | None = None
+        relpath = entry.get("relpath") or chunk.get("file", "")
+        sha1 = entry.get("sha1", "")
+        model = self.client.config.model
         for attempt in range(MAX_RETRIES + 1):
             try:
-                fs = _review_with_timeout(self.client, entry, chunk)
+                fs = do_review_chunk(self.client, entry, chunk,
+                                     mistakes_text=payload.get("mistakes_text", ""))
             except Exception as e:
                 last_err = e
                 err = classify_error(e)
                 if isinstance(err, PermanentError):
                     logger.fail(f"{tag} 补跑永久错误：{type(e).__name__}: {e}")
-                    return {"findings": [], "retry_round": payload["round"] + 1}
+                    if self.cache is not None:
+                        self.cache.put(relpath, sha1,
+                                       chunk["line_start"], chunk["line_end"],
+                                       [], model, context=self.context)
+                    break
                 if attempt >= MAX_RETRIES:
                     break
-                delay = (err.retry_after_sec if err.retry_after_sec
-                         else BASE_DELAY * 2 ** attempt)
-                logger.skip(f"{tag} 补跑瞬时错误（{type(e).__name__}），"
-                            f"{delay:.0f}s 后第 {attempt + 1} 次重试")
+                delay = err.retry_after_sec if err.retry_after_sec else BASE_DELAY * 2 ** attempt
                 time.sleep(delay)
                 continue
             findings = [f.model_dump(mode="json") for f in fs]
-            logger.done(tag=tag, findings=len(findings),
-                        attempt=attempt + 1, llm=len(fs),
-                        tokens=self.client.total_tokens_used)
-            return {"findings": findings, "retry_round": payload["round"] + 1}
+            if self.cache is not None:
+                self.cache.put(relpath, sha1,
+                               chunk["line_start"], chunk["line_end"],
+                               findings, model, context=self.context)
+            logger.done(tag=tag, findings=len(findings))
+            return {"findings": findings, "retry_round": payload["round"] + 1,
+                    "failed_blocks": [{"entry": entry, "chunk": chunk, "resolved": True}]}
 
-        logger.fail(f"{tag} 补跑失败（重试耗尽）："
-                    f"{type(last_err).__name__}: {last_err}")
-        return {"findings": [], "retry_round": payload["round"] + 1}
+        logger.fail(f"{tag} 补跑失败：{type(last_err).__name__}: {last_err}")
+        # mark resolved regardless so the ledger can't loop forever
+        return {"findings": [], "retry_round": payload["round"] + 1,
+                "failed_blocks": [{"entry": entry, "chunk": chunk, "resolved": True}]}
 
-    # ==================== 节点 5：second_review（可选，条件边决定走不走）====================
+    # ---- aggregate ----
+    def aggregate(self, state: dict) -> dict:
+        logger = NodeLogger(state["run_dir"], "aggregate")
+        logger.start()
+        findings = [Finding(**d) for d in state.get("findings", [])]
+        # 增量模式（diff_files 非空）只对变更文件注入 parse_error / LSP 诊断，
+        # 全量模式（diff_set 空）注入全部文件，二者行为与 chunk 节点一致。
+        diff_set = set(state.get("diff_files") or [])
+        inject_files = _incremental_filter(
+            (state.get("project_map") or {}).get("files", []), diff_set)
+        # 语法错误文件在 chunk 节点被跳过、不进 LLM，绝不能静默消失：
+        # 确定性补一条 correctness/critical finding（零 LLM，不依赖缓存）。
+        findings.extend(_parse_error_findings(inject_files))
+        # LSP 确定性诊断（零 LLM）：语言服务器产出的高精度候选 bug，
+        # 与 parse_error 一样在 do_aggregate 前并入。失败/没装服务器时静默跳过。
+        if self.lsp_cfg.get("enabled"):
+            try:
+                findings.extend(lsp_findings(state["root"], inject_files,
+                                             self.lsp_cfg))
+            except Exception:
+                pass  # LSP 是增强项，失败不影响主流程
+        out = do_aggregate(findings, state["root"])
+        (Path(state["run_dir"]) / "findings.json").write_text(
+            json.dumps([f.model_dump(mode="json") for f in out],
+                       ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.done(raw=len(findings), after_qc=len(out))
+        return {"aggregated": [f.model_dump(mode="json") for f in out]}
 
-    def second_review(self, state: ReviewState) -> dict:
-        """终审仲裁（云模型）——并行版。
-
-        原版 cra_second_review 逐文件串行调云 API。这里按文件拆成
-        独立任务，用线程池并行提交：N 个文件的终审耗时 ≈ 最慢那个文件，
-        而不是 N × 单文件耗时。每条发现就地挂回裁决，一条不删。
-        """
+    # ---- second_review (optional) ----
+    def second_review(self, state: dict) -> dict:
         logger = NodeLogger(state["run_dir"], "second_review")
-        findings = [Finding(**d) for d in state["aggregated"]]
-
+        findings = [Finding(**d) for d in state.get("aggregated", [])]
         if not findings:
             logger.done(findings=0)
             return {"aggregated": []}
 
-        # ---- 按文件分组 ----
         by_file: dict[str, list[Finding]] = {}
         for f in findings:
             by_file.setdefault(f.file_path, []).append(f)
-
         logger.start(findings=len(findings), files=len(by_file))
 
         all_out: list[Finding] = []
         save_path = Path(state["run_dir"]) / "findings.json"
+        # 错题本与 scan 读取路径一致：run_dir 上级 memory/mistakes.jsonl
+        mistakes_path = Path(state["run_dir"]).parent / "memory" / "mistakes.jsonl"
 
-        # ---- 并行：每个文件一个任务，独立调 cra_second_review ----
-        # save_path=None 避免多线程抢写同一个文件；所有裁决收齐后统一落盘
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=SECOND_REVIEW_WORKERS) as ex:
-            futures: dict[concurrent.futures.Future, str] = {}
-            for relpath, items in by_file.items():
-                fut = ex.submit(
-                    cra_second_review, items, state["root"],
-                    self.second_client,
-                    save_path=None,   # 禁止内部写盘，线程安全
-                )
-                futures[fut] = relpath
-
-            for fut in concurrent.futures.as_completed(futures):
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=SECOND_REVIEW_WORKERS)
+        try:
+            futures = {ex.submit(do_second_review, items, state["root"],
+                                 self.second_client, None): relpath
+                       for relpath, items in by_file.items()}
+            done, not_done = concurrent.futures.wait(futures,
+                                                     timeout=SECOND_REVIEW_TIMEOUT)
+            for fut in done:
                 relpath = futures[fut]
                 try:
-                    result = fut.result()
-                    all_out.extend(result)
+                    all_out.extend(fut.result())
                 except Exception as e:
-                    # 单文件终审失败：该文件所有发现标 uncertain（保守兜底）
-                    logger.fail(f"{relpath} 终审失败: "
-                                f"{type(e).__name__}: {e}")
-                    items = by_file[relpath]
-                    for f_item in items:
-                        f_item.second_verdict = "uncertain"
-                        f_item.second_reason = \
-                            f"终审失败: {type(e).__name__}"
-                    all_out.extend(items)
+                    logger.fail(f"{relpath} 终审失败: {type(e).__name__}: {e}")
+                    self._mark_uncertain(by_file[relpath], f"终审失败: {type(e).__name__}")
+                    all_out.extend(by_file[relpath])
+            for fut in not_done:
+                relpath = futures[fut]
+                logger.fail(f"{relpath} 终审超时")
+                self._mark_uncertain(by_file[relpath], "终审超时")
+                all_out.extend(by_file[relpath])
+        finally:
+            # shutdown(wait=False) 让超时线程继续后台跑直到 httpx timeout（≤120s）
+            # 结束，是有界泄漏；但其结果不进 findings（not_done 已标 uncertain），
+            # 且不再写错题本（已移到主线程 write_mistakes），所以无副作用。
+            ex.shutdown(wait=False, cancel_futures=True)
 
-        # ---- 按原 id 排序回写 ----
+        # 错题本：只把 done（正常完成）里 rejected 的 finding 写进错题本；
+        # 超时线程不写（其结果不进 all_out，且 second_review 已不再内部写）。
+        write_mistakes(all_out, mistakes_path)
+
         all_out.sort(key=lambda f: f.id)
-
-        # ---- 统一落盘 ----
         save_path.write_text(
             json.dumps([f.model_dump(mode="json") for f in all_out],
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+                       ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # ---- 战报 ----
         counts = {"confirmed": 0, "rejected": 0, "uncertain": 0}
         for f in all_out:
             if f.second_verdict in counts:
                 counts[f.second_verdict] += 1
-        logger.done(
-            confirmed=counts["confirmed"], uncertain=counts["uncertain"],
-            rejected=counts["rejected"],
-            tokens=(self.second_client.total_tokens_used
-                    if self.second_client else 0),
-        )
+        logger.done(**counts)
         return {"aggregated": [f.model_dump(mode="json") for f in all_out]}
 
-    # ==================== 节点 6：report ====================
+    @staticmethod
+    def _mark_uncertain(items: list[Finding], reason: str) -> None:
+        for f in items:
+            f.second_verdict = "uncertain"
+            f.second_reason = reason
 
-    def report(self, state: ReviewState) -> dict:
-        """生成 Markdown 报告。对应原版 REPORT 段。"""
+    # ---- report ----
+    def report(self, state: dict) -> dict:
         logger = NodeLogger(state["run_dir"], "report")
         logger.start()
         run_dir = Path(state["run_dir"])
-        findings = [Finding(**d) for d in state["aggregated"]]
+        findings = [Finding(**d) for d in state.get("aggregated", [])]
         md = render_report(findings, {
             "project": state["root"],
             "file_count": state["project_map"]["file_count"],
             "model": self.client.config.model,
             "tokens": self.client.total_tokens_used,
-            # 漏斗下半段的模型和消耗（没启用就是 None，报告不显示这两行）
             "second_model": (self.second_client.config.model
                              if self.second_client else None),
             "second_tokens": (self.second_client.total_tokens_used
                               if self.second_client else None),
         })
         (run_dir / "report.md").write_text(md, encoding="utf-8")
-        logger.done(findings=len(findings),
-                    path=str(run_dir / "report.md"))
+        # 节流落盘兜底：review_chunk 并发 put 后可能只置了 dirty，run 结束前写盘。
+        if self.cache is not None:
+            self.cache.flush()
+        logger.done(findings=len(findings), path=str(run_dir / "report.md"))
         return {"report_done": True}

@@ -1,44 +1,177 @@
-# Code Review Agent — LangGraph 编排版
+# lra — LangGraph Review Agent (v2)
 
-多 Agent 代码审查 + 自动修复：扫描 → 切块 → LLM 初审（跨文件依赖感知）→ 聚合质检 →（可选终审）→ 报告 → **自动修复闭环**。
+A code review agent built as a LangGraph map-reduce pipeline. Self-contained
+single package, no sibling packages, no reference copies, no committed secrets.
 
-> **当前版本是 `v2/`**（单包自包含重写）。旧版 `cra/` + `lra/` 保留作历史参考，不再维护。完整文档见 **[v2/README.md](v2/README.md)**。
+## Pipeline
 
----
-
-## 一句话
-
-编程 Agent 是「全科医生」，本系统是「体检中心」——批量筛查、精准定位、自动开刀、无需挂号排队。
-
-## 实测成绩（v2 · deepseek-v4-flash · 思考模式关闭）
-
-| 数据集 | 召回率 | 文件级精确率 | 全量耗时 | Token |
-|--------|:------:|:----------:|:------:|------:|
-| quixbugs Java（40 缺陷程序） | **95.0%** | 84.4% | 28.3s | 59k |
-| quixbugs Python（40 缺陷程序） | **90.0%** | 87.8% | 34.2s | 61k |
-
-重复审查（代码未变）：**0 请求 · 0 token · 0.1s**（sha1 增量缓存命中）。
-
-## 三条关键调优结论
-
-1. **关掉思考模式**（`extra_body: {"thinking": {"type": "disabled"}}）——DeepSeek 思考默认开启且 `temperature` 失效，`reasoning_content` 占 token 导致 JSON 截断。关掉后：JSON 失败 5→0、token 291k→59k、143s→28s、召回率上升。
-2. **用 `deepseek-v4-flash` 而非 `-pro`**——pro 实测全面更差（12 失败 vs 5、315s vs 143s），更强模型反而更不守格式。
-3. **rpm 120 + 并发 16**——实测 100 并发零 429，旧 rpm 6 过度保守。
-
-## 快速开始
-
-```bash
-cd v2
-cp config.example.yaml config.yaml    # 填 api_key_env 对应的环境变量
-python -m lra review /path/to/project
-python -m lra review /path/to/project --incremental
-python -m lra optimize runs/<thread-id> --backend api --max-rounds 3
+```
+scan ──► chunk ──► fan-out ──► review_chunk (parallel) ──► aggregate
+                                                              │
+                              ┌───────────────────────────────┤
+                              ▼                               ▼
+                     second_review (optional)            report ──► END
+                              │
+                              └──► report
 ```
 
-依赖：`langgraph` / `httpx` / `pydantic` / `pyyaml`（见 `v2/pyproject.toml`）。
+- **scan** — build a project index (file list + symbol table) with `ast` for
+  Python and lightweight heuristics for other languages. Zero LLM.
+- **chunk** — split files along symbol boundaries so functions are never cut
+  in half. Zero LLM.
+- **review_chunk** — one LLM call per chunk, fanned out by `Send`. Deterministic
+  security / anti-pattern scanners + cross-file dependency context run first,
+  then the LLM's findings are merged in.
+- **aggregate** — evidence verification (line-number correction), de-duplication,
+  global id reassignment. Zero LLM.
+- **second_review** — optional cloud arbitration that confirms/rejects/defers
+  each finding, run per-file in parallel.
+- **report** — render `report.md`.
 
-## 功能全景
+## Usage
 
-审查（scan/chunk/并行初审/聚合/终审/报告）、零 LLM 安全扫描器、跨文件依赖图、自定义规则注入、错题本、结构化输出三层容错（JSON mode → 机械修复 → 字段提取）、sha1 增量缓存、优化闭环（修复缓存 + 停滞检测）、8 语言高频陷阱补丁、`scripts/analyze.py` 召回率/精确率评估。
+```bash
+cp config.example.yaml config.yaml   # then export the API key env vars
+python -m lra review /path/to/project
+python -m lra review /path/to/project --incremental          # git diff only
+python -m lra review /path/to/project --issue-hint "check for SQL injection"
 
-详见 **[v2/README.md](v2/README.md)** 的完整「调优决策记录」。
+# after a review, run the fix loop on the findings
+python -m lra optimize runs/<thread-id> --backend api --max-rounds 3
+python -m lra optimize runs/<thread-id> --backend api --issue-hint "check for SQL injection"
+```
+
+Resume / retry / cache:
+
+```bash
+python -m lra review /path/to/project --thread-id my-run   # resume same thread
+python -m lra review /path/to/project --thread-id my-run --retry-failed
+python -m lra review /path/to/project --no-cache           # skip sha1 cache
+```
+
+Run artifacts land in `runs/<thread-id>/`: `project_map.json`, `findings.json`,
+`report.md`, `checkpoints.sqlite`. A cross-run findings cache lives at
+`runs/.findings_cache.json`.
+
+## Feature map
+
+| Layer | Modules |
+| --- | --- |
+| LLM | `client` (thread-safe, real httpx timeout, env-key, JSON mode) · `structured` (parse → repair → prose-extract → retry) · `prompts` (profile variants + 8 language supplements) |
+| Analysis | `scan` (ast + heuristics) · `chunking` (symbol-boundary) · `dep_graph` (cross-file import graph) · `lsp` (language-server diagnostics) |
+| Agents | `reviewer` · `aggregator` · `second_reviewer` · `rules` (`.codereview/rules.json`) |
+| Tools | `security_scanner` · `anti_pattern_scanner` · `lsp_client` (JSON-RPC over stdio) — deterministic, zero LLM, honest confidence |
+| Optimizer | `copier` · `fixer` (api/opencode, compile gate) · `verifier` · `loop` (fix cache + stall detection) |
+| Misc | `mistake_notebook` (rejected findings → negative samples) · `cache` (sha1 findings cache) |
+
+Evaluation: `python scripts/analyze.py <run_dir> <quixbugs_dir> --correct-dir
+<correct_dir>` computes recall/precision against the quixbugs known-bug dataset;
+`--correct-dir` (the corrected programs) enables the line-level recall metric.
+
+## Configuration
+
+See `config.example.yaml`. Secrets are read from environment variables named by
+each profile's `api_key_env`; keys are never stored in the repo. The `cloud`
+(DeepSeek) profile ships with `extra_body: {"thinking": {"type": "disabled"}}`
+already set — see tuning decision #1 below for why.
+
+The `lsp` section (default `enabled: false`) turns on deterministic
+language-server diagnostics: severity-Error diagnostics become `correctness`
+findings directly, while Warning/Info/Hint are injected into the reviewer prompt
+as candidates for the LLM to verify. It requires each configured server on PATH
+(`pip install pyright` provides `pyright-langserver`); missing or broken servers
+are skipped silently, so leave it off unless they are installed.
+
+## Tuning decisions (why it's configured this way)
+
+These are empirical findings from real A/B runs on the quixbugs dataset. Do not
+revert them without re-measuring.
+
+1. **Disable thinking mode.** DeepSeek's thinking mode is ON by default
+   (effort=high), and `temperature` is ignored while it's on. `reasoning_content`
+   consumes tokens and truncates the JSON output. With
+   `extra_body: {"thinking": {"type": "disabled"}}`, JSON failures went 5 → 0,
+   tokens 291k → 59k, wall time 143s → 28s, and recall rose. This is the single
+   highest-impact setting.
+2. **Use `deepseek-v4-flash`, not `-pro`.** pro tested worse on every axis:
+   12 JSON failures vs 5, 315s vs 143s, 362k vs 291k tokens — because a
+   stronger model is *less* format-compliant. For strict-JSON output,
+   "obedient" beats "smart".
+3. **rpm 120, concurrency 16.** Probing 20/50/100 concurrent requests returned
+   zero 429s, so the old `rpm: 6` was wildly conservative. 8× faster.
+4. **sha1 findings cache.** scan already hashes every file; `review_chunk`
+   skips the LLM when `(file, sha1, line range)` is cached. The key also
+   embeds the model name and a `CACHE_VERSION` (bump it when prompts/schema
+   change) so stale results never surface. Repeat runs: 0 requests, 0.1s.
+5. **Structured output is three-layered.** JSON mode (prevention) → mechanical
+   repair → prose field-extraction (rescue) → LLM retry. The prose extractor
+   only trusts a category/severity that appears *uniquely within a block*, and
+   never extracts `evidence` verbatim — the aggregator re-reads source lines by
+   the reported line number instead.
+
+### Measured results (quixbugs, deepseek-v4-flash, thinking off)
+
+| Metric | Java (40 buggy) | Python (40 buggy) |
+| --- | --- | --- |
+| Recall (line-level) | 57.5% | 60.0% |
+| File-level precision | 84.4% | 87.8% |
+| JSON failures | 0 | 0 |
+| Wall time (full run) | 28.3s | 34.2s |
+| Tokens | 59k | 61k |
+
+Recall is reported **line-level**: a finding must cover the actual bug line
+(`scripts/analyze.py --correct-dir` diffs the corrected program to locate it).
+File-level recall (~95%/~90%) merely counts a finding landing anywhere in the
+buggy file, so it inflates the number and is no longer the headline metric.
+
+### Optimization history (effect of each change)
+
+Every number below was measured on the same quixbugs Java set (48 files) with
+`deepseek-v4-flash`, unless noted. "Before/after" are real runs, not estimates.
+
+| Change | Before | After | Gain |
+| --- | --- | --- | --- |
+| Disable thinking mode (`thinking: disabled`) | 5 JSON failures, 291k tokens, 143.8s, 50 findings | 0 failures, 59k tokens, 28.3s, 85 findings | failures zeroed · -80% tokens · 5× faster |
+| rpm 6 → 120 + concurrency 4 → 16 | full run 1439s | 143.8s | 8.4× faster |
+| sha1 findings cache | repeat run 28.3s / 59k tokens | 0.1s / 0 tokens | zero LLM requests |
+| JSON mode + prose field-extraction | failure rate 25% (12/48) | 10% (5/48) | -58% failures |
+| Second review thinking ON (`deepseek-pro-think`) | confirmed precision 35.4% | 45.2% | +10pp precision |
+| Line-level metric (`analyze.py --correct-dir`) | "recall 95%" (file-level, inflated) | 57.5% line-level (honest) | honest headline |
+
+Finding-level precision (a finding covering the real bug line, over all
+findings): Java 33.8%, Python 41.3% — the tool is recall-oriented ("rather
+over-report than miss"), which is the intended trade-off.
+
+### Test count evolution
+
+| Stage | Tests | What landed |
+| --- | --- | --- |
+| v2 rewrite | 78 | single-package core + graph/state/nodes + CLI |
+| +correctness category, field-extraction, rules, mistake notebook, profile prompts | 85 | |
+| +evaluation line-level, ignore-list merge, cache throttle, build re-verify, notebook dedupe | 107 | |
+| +LSP integration | 113 | |
+| +LSP two-stage (error direct, warning→LLM verify) | 119 | |
+| +issue-hint (review + optimize) | 124 | |
+| +notebook dedupe key (file,title), README sync | 126 | |
+| round-3 fixes (rootUri, incremental, LSP perf, fingerprint granularity) | 137 | |
+| +optimize resume + second_review thread-leak fix | 141 | |
+
+Common misses (model capability boundary, not config): quicksort (drops
+pivot-equal elements) and reverse_linked_list (pointer mis-wiring) — both are
+subtle logic bugs in both languages.
+
+## Design notes
+
+- **No wall-clock kill switch on LLM calls.** Python threads cannot be force
+  killed, so a "node-level timeout" wrapping a blocking call is fake —
+  `ThreadPoolExecutor.__exit__` blocks on shutdown anyway. Real timeouts come
+  from `httpx`; on top of that, transient errors retry with exponential backoff.
+- **Thread-safe token accounting.** The client guards its counters with a lock.
+- **Failed-block ledger deduplicates and resolves.** A custom reducer keys
+  `failed_blocks` by `(file, line range)` and drops a block once retried, so
+  `--retry-failed` never re-runs a recovered block.
+
+## Not in scope (deliberately)
+
+- **symbol_backend / distill / aging** — the old config declared these but the
+  implementations never existed; they were dead switches, not features.
