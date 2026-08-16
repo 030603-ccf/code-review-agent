@@ -1,5 +1,5 @@
 [project]
-name = "lra"
+name = "lra-code-review"
 version = "2.1.0"
 description = "Code review agent built on LangGraph — self-contained single package"
 readme = "README.md"
@@ -32,6 +32,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 lra = "lra.__main__:main"
+lra-code-review = "lra.__main__:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

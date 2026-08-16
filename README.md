@@ -8,9 +8,9 @@
 ## 安装
 
 ```bash
-pip install lra
+pip install lra-code-review
 # 或临时跑一次
-uvx lra review /path/to/project
+uvx lra-code-review review /path/to/project
 ```
 
 源码开发安装见下（推荐从 GitHub clone）：
