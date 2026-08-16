@@ -1,5 +1,7 @@
 # lra — LangGraph 代码审查智能体
 
+[![test](https://github.com/030603-ccf/code-review-agent/actions/workflows/test.yml/badge.svg)](https://github.com/030603-ccf/code-review-agent/actions/workflows/test.yml)
+
 基于 LangGraph map-reduce 流水线构建的代码审查工具。单包自包含，无兄弟包、无参考副本、无提交的密钥。
 
 ## 流水线
