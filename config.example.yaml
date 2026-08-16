@@ -18,10 +18,12 @@ profiles:
     timeout: 120
 
   # Example cloud endpoint. Put the key in the named env var.
+  # deepseek-v4-flash is the recommended model (see README: it beats -pro on
+  # strict-JSON compliance and cost); deepseek-chat is the public API alias.
   cloud:
     base_url: "https://api.deepseek.com"
     api_key_env: "DEEPSEEK_API_KEY"
-    model: "deepseek-chat"
+    model: "deepseek-v4-flash"
     temperature: 0.2
     max_tokens: 4096
     timeout: 60
