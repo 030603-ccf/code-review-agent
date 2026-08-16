@@ -7,7 +7,7 @@ aggregate 节点过去对 project_map 的全部文件注入 parse_error 与 LSP 
 - 全量模式（diff_set 空）行为不变，全部文件照常注入。
 """
 
-from lra.nodes import Nodes, _incremental_filter
+from lra.nodes import Nodes, _incremental_filter, _mode_filter
 
 
 def _files():
@@ -99,3 +99,20 @@ def test_aggregate_full_mode_lsp_injects_all(tmp_path, monkeypatch):
     monkeypatch.setattr("lra.nodes.lsp_findings", fake_lsp_findings)
     Nodes(None, lsp_cfg={"enabled": True}).aggregate(state)
     assert received["files"] == ["changed.py", "unchanged.py"]
+
+
+# --- strict 零变更：空 diff_files 不能退化回全量 ---------------------------------
+
+
+def test_mode_filter_strict_empty_diff_returns_empty():
+    files = _files()
+    assert _mode_filter(files, [], incremental=True) == []
+    assert _mode_filter(files, None, incremental=True) == []
+
+
+def test_mode_filter_full_and_partial_semantics_unchanged():
+    files = _files()
+    # 旧语义：非增量 / 有变更文件时行为与 _incremental_filter 一致
+    assert _mode_filter(files, [], incremental=False) is files
+    assert [f["relpath"] for f in _mode_filter(
+        files, ["changed.py"], incremental=True)] == ["changed.py"]

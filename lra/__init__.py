@@ -7,4 +7,4 @@ import from, and no reference/backup copies in the tree.
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-__version__ = "2.0.0"
+__version__ = "2.1.0"

@@ -28,9 +28,11 @@ profiles:
     max_tokens: 4096
     timeout: 60
     rpm: 60            # requests/minute cap; the client throttles to avoid 429
-    # DeepSeek thinking mode is ON by default and ignores `temperature`;
-    # reasoning_content bloats the JSON output. Disable it explicitly.
-    extra_body: {"thinking": {"type": "disabled"}}
+    # DeepSeek 思考模式默认开启且忽略 `temperature`：能显著提升 bug 检出率
+    # （quixbugs 行级召回 57.5%→92.5%）。但 reasoning 与正文共享 max_tokens
+    # 预算，必须同步把 lra/agents/reviewer.py 的 MAX_OUTPUT_TOKENS 调到
+    # 16384，否则 reasoning 会吃满 2048 把正文 JSON 截断（no JSON object found）。
+    extra_body: {"thinking": {"type": "enabled"}}
 
   # Qwen text flagship (Aliyun DashScope). Requires a STANDARD pay-as-you-go
   # `sk-` key (NOT a Token Plan `sk-sp-` key) in DASHSCOPE_API_KEY.

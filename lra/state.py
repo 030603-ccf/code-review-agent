@@ -47,7 +47,14 @@ class ReviewState(TypedDict, total=False):
     # CLI-provided
     root: str
     run_dir: str
-    diff_files: list[str]
+    diff_files: list[str] | None
+    # True 表示本次 run 只审 diff 变更文件。它独立于 diff_files 存在：
+    # strict 增量模式下 diff_files 可以为 []（零变更 = 零文件审查），
+    # 若只看 diff_files 会把空列表误当成"未提供、全量审查"。
+    incremental: bool
+    # CLI 选择的实际审查模式：full / incremental / full_fallback。
+    # 写入 state 让断点续跑时 summary.json 仍能读到首次 run 的模式。
+    review_mode: str
     issue_hint: str
     second_client_enabled: bool
 
@@ -66,6 +73,10 @@ class ReviewState(TypedDict, total=False):
     # parallel review accumulation
     findings: Annotated[list[dict], operator.add]
     failed_blocks: Annotated[list[dict], _merge_failed]
+    # 结构化输出永久失败（重试无意义）的块：不进 failed_blocks 账本（那账本
+    # 只登记可重试的瞬时失败），但要进 summary.json，让 MCP 等调用方能区分
+    # "LLM 永久失败"与"LLM 瞬时失败耗尽"。
+    llm_errors: Annotated[list[dict], operator.add]
     retry_round: Annotated[int, _retry_round_reducer]
 
     # aggregate / second_review / report

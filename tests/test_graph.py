@@ -55,14 +55,16 @@ def mini_project(tmp_path):
     return tmp_path
 
 
-def _run(client, judge, root, run_dir, thread_id="t-e2e"):
+def _run(client, judge, root, run_dir, thread_id="t-e2e", extra_state=None):
     config = {"configurable": {"thread_id": thread_id}, "max_concurrency": 3}
+    state = {"root": str(root), "run_dir": str(run_dir),
+             "second_client_enabled": judge is not None}
+    if extra_state:
+        state.update(extra_state)
     with SqliteSaver.from_conn_string(
             str(run_dir / "checkpoints.sqlite")) as saver:
         graph = build_graph(client, judge).compile(checkpointer=saver)
-        return graph.invoke(
-            {"root": str(root), "run_dir": str(run_dir),
-             "second_client_enabled": judge is not None}, config)
+        return graph.invoke(state, config)
 
 
 def test_end_to_end_with_second_review(mini_project, tmp_path):
@@ -159,6 +161,9 @@ def test_retry_failed_keeps_block_when_still_failing(tmp_path):
     assert blocks[0].get("resolved") is not True
     assert blocks[0]["chunk"]["line_start"] == 1
     assert blocks[0]["error"]
+    # 永久错误同时进入 llm_errors，summary.json 借此区分瞬时/永久失败
+    assert len(out["llm_errors"]) == 1
+    assert out["llm_errors"][0]["chunk"]["line_start"] == 1
 
 
 def test_retry_failed_rewind_reruns_failed_blocks(mini_project, tmp_path):
@@ -222,3 +227,25 @@ def test_resume_same_thread_id_no_extra_requests(mini_project, tmp_path):
         assert snap.values and not snap.next
         graph.invoke(None, config)
     assert client.total_requests == 2
+
+
+def test_strict_incremental_zero_changes_reviews_nothing(mini_project, tmp_path):
+    """strict 零变更（incremental=True + diff_files=[]）必须零 LLM 请求、零发现。
+
+    空 diff_files 不能再走"空=全量"的旧语义，否则 --incremental-strict 会
+    静默退化成一次全量审查。
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    client = FakeClient()
+
+    result = _run(client, None, mini_project, run_dir, thread_id="t-strict-empty",
+                  extra_state={"incremental": True, "diff_files": [],
+                               "review_mode": "incremental"})
+
+    assert client.total_requests == 0
+    assert result.get("aggregated") == []
+    saved = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
+    assert saved == []
+    md = (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "未发现问题" in md

@@ -21,7 +21,11 @@ _FMT = (
     '"confidence": 0.0到1.0}]}'
 )
 
-MAX_OUTPUT_TOKENS = 2048
+# 思考模式（thinking）下 reasoning 与正文共享 max_tokens 预算，且本常量会
+# 通过 _estimate_max_tokens 覆盖 config.yaml 的 max_tokens。开思考时必须给足
+# 预算（16384），否则 reasoning 会吃满 2048 把正文 JSON 截断成
+# "no JSON object found"。实测（quixbugs）：开思考 + 16384 行级召回 57.5%→92.5%。
+MAX_OUTPUT_TOKENS = 16384
 TOKEN_BUFFER = 128
 CHARS_PER_TOKEN = 3.5
 

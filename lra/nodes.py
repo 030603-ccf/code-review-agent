@@ -39,7 +39,11 @@ MAX_RETRIES = 5
 BASE_DELAY = 2.0
 MAX_RETRY_ROUNDS = 1
 SECOND_REVIEW_WORKERS = 8
-SECOND_REVIEW_TIMEOUT = 120.0
+SECOND_REVIEW_TIMEOUT = 120.0          # 小项目基础预算（秒）
+# 单次终审调用的预算（秒）：pro 思考模式实测单次约 13s，留余量取 20s。
+# 终审超时随「文件数 / 并发 × 该预算」伸缩，避免大项目（如 162 文件的
+# human-eval）在固定 120s 内跑不完、被误标「终审超时」。
+SECOND_REVIEW_PER_CALL_SECONDS = 20.0
 
 # 文件级过滤（按文件名 glob），目录级过滤统一走 lra.ignore。
 SKIP_GLOBS = ("*.min.js", "*.min.css", "*.min.js.map", "*.pb.go",
@@ -123,6 +127,24 @@ def _incremental_filter(files: list[dict], diff_set: set[str]) -> list[dict]:
     return [f for f in files if f.get("relpath") in diff_set]
 
 
+def _mode_filter(files: list[dict], diff_files: list[str] | None,
+                 incremental: bool) -> list[dict]:
+    """按本次 run 的实际模式过滤文件。
+
+    三种情况：
+      - incremental=False              → 全量，原样返回（含 full_fallback）
+      - incremental=True 且 diff 非空 → 只保留变更文件
+      - incremental=True 且 diff 为空 → strict 零变更，返回 []
+
+    空的 ``diff_files`` 不能再用"空集合=全量"的旧语义：strict 模式下空集合
+    必须表示"一个文件都不审"，否则 --incremental-strict 会静默退化成全量。
+    """
+    if not incremental:
+        return files
+    diff_set = set(diff_files or [])
+    return [f for f in files if f.get("relpath") in diff_set]
+
+
 class Nodes:
     def __init__(self, client, second_client=None, cache=None, context="",
                  lsp_cfg=None):
@@ -157,13 +179,17 @@ class Nodes:
         logger.start()
         root = Path(state["root"])
         pm = state["project_map"]
-        diff_set = set(state.get("diff_files") or [])
+        # 兼容旧 checkpoint：没有 incremental 字段时，用 diff_files 是否
+        # 非空来推断增量语义；strict 零变更由 incremental=True + [] 表达。
+        diff_files = state.get("diff_files")
+        incremental = bool(state.get("incremental")) or bool(diff_files)
+        diff_set = set(diff_files or [])
         work: list[dict] = []
         for entry in pm["files"]:
             relpath = entry["relpath"]
             if _should_skip(relpath):
                 continue
-            if diff_set and relpath not in diff_set:
+            if incremental and relpath not in diff_set:
                 continue
             if entry.get("parse_error"):
                 continue
@@ -217,7 +243,7 @@ class Nodes:
             for relpath, text in candidates.items():
                 unique_entries[relpath]["_lsp_candidates"] = text
 
-        logger.done(files=len(pm["files"]), chunks=len(work), diff_only=bool(diff_set))
+        logger.done(files=len(pm["files"]), chunks=len(work), diff_only=incremental)
         return {"work": work}
 
     # ---- review_chunk (parallel fan-out worker) ----
@@ -269,7 +295,9 @@ class Nodes:
                     # 永久错误（JSON 输出失败）**不进缓存**：此时只有 tool_findings
                     # / 空清单，若写缓存，后续 run 会把它当完整命中、该块 LLM 审查
                     # 永久丢失。只有成功（LLM 返回合法 findings）才 put 缓存。
-                    return {"findings": tool_findings}
+                    return {"findings": tool_findings,
+                            "llm_errors": [{"entry": entry, "chunk": chunk,
+                                            "error": f"{type(e).__name__}: {str(e)[:200]}"}]}
                 if attempt >= MAX_RETRIES:
                     break
                 delay = err.retry_after_sec if err.retry_after_sec else BASE_DELAY * 2 ** attempt
@@ -298,6 +326,7 @@ class Nodes:
         logger.start(tag=tag)
 
         last_err: Exception | None = None
+        permanent_error: dict | None = None
         relpath = entry.get("relpath") or chunk.get("file", "")
         sha1 = entry.get("sha1", "")
         model = self.client.config.model
@@ -313,6 +342,8 @@ class Nodes:
                     logger.fail(f"{tag} 补跑永久错误：{type(e).__name__}: {e}")
                     # 永久错误不进缓存（与 review_chunk 一致：只有成功才 put），
                     # 否则空清单会被当成完整命中、该块审查永久丢失。
+                    permanent_error = {"entry": entry, "chunk": chunk,
+                                       "error": f"{type(e).__name__}: {str(e)[:200]}"}
                     break
                 if attempt >= MAX_RETRIES:
                     break
@@ -333,20 +364,26 @@ class Nodes:
         # 单次 run 内不会死循环：fan_out_failed 用 MAX_RETRY_ROUNDS 封顶，
         # retry_round+1 之后不再路由到 retry_failed。旧实现这里也标 resolved，
         # 导致跑完后 failed_blocks 恒为空，--retry-failed 永远找不到可补跑的块。
-        return {"findings": [], "retry_round": payload["round"] + 1,
-                "failed_blocks": [{"entry": entry, "chunk": chunk,
-                                   "error": f"{type(last_err).__name__}: {str(last_err)[:200]}"}]}
+        out = {"findings": [], "retry_round": payload["round"] + 1,
+               "failed_blocks": [{"entry": entry, "chunk": chunk,
+                                  "error": f"{type(last_err).__name__}: {str(last_err)[:200]}"}]}
+        if permanent_error:
+            out["llm_errors"] = [permanent_error]
+        return out
 
     # ---- aggregate ----
     def aggregate(self, state: dict) -> dict:
         logger = NodeLogger(state["run_dir"], "aggregate")
         logger.start()
         findings = [Finding(**d) for d in state.get("findings", [])]
-        # 增量模式（diff_files 非空）只对变更文件注入 parse_error / LSP 诊断，
-        # 全量模式（diff_set 空）注入全部文件，二者行为与 chunk 节点一致。
-        diff_set = set(state.get("diff_files") or [])
-        inject_files = _incremental_filter(
-            (state.get("project_map") or {}).get("files", []), diff_set)
+        # 与 chunk 节点一致：parse_error / LSP 诊断只注入本次 run 实际审查的文件。
+        # strict 零变更（incremental=True + diff_files=[]）必须注入空集，
+        # 不能沿用旧的"空集合=全量"语义。
+        diff_files = state.get("diff_files")
+        incremental = bool(state.get("incremental")) or bool(diff_files)
+        inject_files = _mode_filter(
+            (state.get("project_map") or {}).get("files", []),
+            diff_files, incremental)
         # 语法错误文件在 chunk 节点被跳过、不进 LLM，绝不能静默消失：
         # 确定性补一条 correctness/critical finding（零 LLM，不依赖缓存）。
         findings.extend(_parse_error_findings(inject_files))
@@ -392,8 +429,9 @@ class Nodes:
             futures = {ex.submit(do_second_review, copy.deepcopy(items),
                                  state["root"], self.second_client, None): relpath
                        for relpath, items in by_file.items()}
-            done, not_done = concurrent.futures.wait(futures,
-                                                     timeout=SECOND_REVIEW_TIMEOUT)
+            timeout = max(SECOND_REVIEW_TIMEOUT,
+                          len(by_file) / SECOND_REVIEW_WORKERS * SECOND_REVIEW_PER_CALL_SECONDS)
+            done, not_done = concurrent.futures.wait(futures, timeout=timeout)
             for fut in done:
                 relpath = futures[fut]
                 try:
