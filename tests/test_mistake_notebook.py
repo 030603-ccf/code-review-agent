@@ -210,6 +210,8 @@ def test_second_review_timeout_thread_does_not_write_mistakes(tmp_path, monkeypa
 
     monkeypatch.setattr(nodes_mod, "SECOND_REVIEW_TIMEOUT", 0.3)
     monkeypatch.setattr(nodes_mod, "SECOND_REVIEW_WORKERS", 2)
+    # 动态超时项置 0，让 monkeypatch 的 0.3s 超时生效（否则会被 per-call 预算覆盖）
+    monkeypatch.setattr(nodes_mod, "SECOND_REVIEW_PER_CALL_SECONDS", 0.0)
 
     finished = threading.Event()
 
