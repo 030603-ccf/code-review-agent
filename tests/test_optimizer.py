@@ -6,7 +6,9 @@ No network, no real opencode — fake clients and monkeypatched subprocess only.
 
 import argparse
 import json
+import os
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -839,10 +841,22 @@ def test_loop_resume_drifted_ids_merge_and_no_keyerror(tmp_path):
     assert st.data["findings"]["F2"]["status"] == "verified"  # 新 id 被注册并修好
 
 
+def _fake_nt_os():
+    """模拟 Windows 的 os 模块（name="nt"），不污染全局 os.name。
+
+    verifier.run_build_check 只读 os.pathsep / os.environ / os.name 三个属性，
+    这里用真实 pathsep/environ 拼一个轻量替身。直接 monkeypatch 全局 os.name
+    会让 Linux 上的 pathlib.Path 误判为 WindowsPath 而抛 NotImplementedError。
+    """
+    return types.SimpleNamespace(
+        name="nt", pathsep=os.pathsep, environ=os.environ,
+    )
+
+
 def test_run_build_check_routes_cmd_bat_through_cmd(monkeypatch, tmp_path):
     """.cmd/.bat 命令在 Windows 上走 cmd /c 转交，避免 WinError 193。"""
     import lra.optimizer.verifier as v
-    monkeypatch.setattr(v.os, "name", "nt")
+    monkeypatch.setattr(v, "os", _fake_nt_os())
     captured = {}
 
     def fake_run(argv, **kw):
@@ -865,7 +879,7 @@ def test_run_build_check_routes_cmd_bat_through_cmd(monkeypatch, tmp_path):
 def test_run_build_check_oserror_treated_as_skipped(monkeypatch, tmp_path):
     """subprocess.run 抛 OSError（如 WinError 193）时按 skipped 处理，不崩。"""
     import lra.optimizer.verifier as v
-    monkeypatch.setattr(v.os, "name", "nt")
+    monkeypatch.setattr(v, "os", _fake_nt_os())
 
     def fake_run(argv, **kw):
         raise OSError(193, "not a valid Win32 application")
