@@ -175,3 +175,23 @@ subtle logic bugs in both languages.
 
 - **symbol_backend / distill / aging** — the old config declared these but the
   implementations never existed; they were dead switches, not features.
+
+## Changelog (major changes and their effect)
+
+Each entry maps to a git commit on `main`; the effect column is the measured
+delta, not a projection.
+
+| Change | Effect |
+| --- | --- |
+| v2 single-package rewrite (lra only, no cra/reference copies) | clean 78-test baseline |
+| Port back optimizer / rules / mistake-notebook / dep-graph / field-extraction / 8 language supplements / evaluation script | features restored, tests 85 |
+| Disable DeepSeek thinking mode (`thinking: disabled`) | JSON failures 5→0, tokens -80%, 5× faster |
+| rpm 6→120 + concurrency 16 | full Java run 1439s → 143.8s (8.4×) |
+| sha1 findings cache + CACHE_VERSION + model in key | repeat run 0 requests / 0.1s |
+| Line-level recall metric (`analyze.py --correct-dir`) | honest 57.5% vs inflated 95% |
+| Round-1 review fixes (package-data, cache key dims, parse_error, extra_body) | installability + correctness |
+| Round-2 review fixes (rootUri, incremental, LSP perf, fingerprint, dedupe key, README) | LSP rootUri + incremental semantics |
+| optimize resume (OptState.load + persistent FixCache) + second_review thread-leak fix | real resume, no side-effect leaks |
+| Directory restructure: v2 promoted to repo root, all legacy removed | repo == clean new project |
+
+Test count: **78 → 141** across the above.
