@@ -5,6 +5,9 @@ up immediately on permanent ones (bad output that retrying cannot fix).
 """
 
 
+import json
+
+
 class LRAError(Exception):
     """Base class for lra's own errors."""
 
@@ -47,6 +50,10 @@ def classify_error(exc: Exception) -> TransientError | PermanentError:
     if any(t in name for t in _TRANSIENT_NAME_TOKENS):
         return TransientError(msg)
     if isinstance(exc, (ConnectionError, TimeoutError)):
+        return TransientError(msg)
+    # Malformed success responses from the LLM proxy (non-JSON body, empty
+    # choices, missing keys) are transient glitches, not permanent failures.
+    if isinstance(exc, (json.JSONDecodeError, IndexError, KeyError)):
         return TransientError(msg)
     if hasattr(exc, "response"):
         code = getattr(exc.response, "status_code", 0)

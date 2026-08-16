@@ -32,17 +32,20 @@ _SYNTAX_TITLE_MARKERS = ("语法", "syntax", "解析失败")
 
 
 def _build_can_verify(f) -> bool:
-    """build/lint 只能确定性验证「语法/风格类」问题已消除；语义类不能。
+    """build/lint 只能确定性验证「语法类」与 best_practice 问题；语义类不能。
 
     security/correctness 的 SQL 注入、逻辑 bug 等 ruff/lint 根本查不出来，
-    「没 lint 报错」不等于「修好了」，据此标 verified 就是假复查。只有语法错误类
-    （标题含 语法/syntax/解析失败，含 _parse_error_findings 生成的「语法解析失败」
-    correctness finding）和 best_practice 等 lint 可覆盖的类才能由 build 通过确认。
+    performance/readability 同样不是 lint 能查出的，据此标 verified 就是假复查。
+    白名单只有两类：
+      1. 语法错误类标题（含 语法/syntax/解析失败，含 _parse_error_findings 生成的
+         「语法解析失败」correctness finding）——compile/lint 能确定性判死；
+      2. best_practice——ruff/lint 直接可覆盖（未使用 import 等）。
+    其余（security/correctness/performance/readability）一律 False，交给 llm 复查。
     """
     title = (getattr(f, "title", "") or "").lower()
     if any(m in title for m in _SYNTAX_TITLE_MARKERS):
         return True
-    return getattr(f, "category", "") not in {"security", "correctness"}
+    return getattr(f, "category", "") == "best_practice"
 
 
 class FindingVerdict(BaseModel):
@@ -78,6 +81,11 @@ def run_build_check(copy_root, command: str = "ruff check",
         result.skipped = f"{parts[0]} 不在 PATH，跳过"
         return result
     parts[0] = exe
+    # Windows 上 .cmd/.bat 不能直接被 CreateProcess 执行（pipx/npm 装法常见），
+    # 经 cmd /c 转交（仿 lra/analysis/lsp.py 的 _resolve_server_cmd），
+    # 否则 subprocess.run 抛 WinError 193。
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        parts = ["cmd", "/c"] + parts
     try:
         proc = subprocess.run(
             parts, cwd=str(copy_root), capture_output=True, text=True,
@@ -86,6 +94,10 @@ def run_build_check(copy_root, command: str = "ruff check",
     except subprocess.TimeoutExpired:
         result.passed = False
         result.output = f"（超时 {timeout}s，已终止）"
+        return result
+    except OSError as e:
+        # 命令无法运行（如 WinError 193 未正确转交、权限不足等）→ 按 skipped 处理
+        result.skipped = f"命令无法运行：{e}"
         return result
     result.output = ((proc.stdout or "") + (proc.stderr or "")).strip()
     result.passed = proc.returncode == 0

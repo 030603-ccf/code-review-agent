@@ -124,6 +124,15 @@ def cmd_review(args: argparse.Namespace) -> int:
         graph = builder.compile(checkpointer=saver)
         snap = graph.get_state(config)
         if snap.values:
+            # 续跑校验：thread_id 相同但目标项目变了 = 不是同一次 run。绝不能
+            # 拿 A 项目的 checkpoint 当 B 项目的续跑结果（scan 不重跑、project_map
+            # 仍是 A 的，产出会张冠李戴）。检测到路径不一致直接报错，让用户换
+            # 一个 --thread-id 重跑。
+            prev_root = snap.values.get("root")
+            if prev_root is not None and Path(prev_root).resolve() != root:
+                print(f"错误：thread {thread_id} 的 checkpoint 指向 {prev_root}，"
+                      f"与本次目标 {root} 不一致。请换一个 --thread-id 重新跑。")
+                return 1
             if args.retry_failed and not snap.next and snap.values.get("failed_blocks"):
                 print(f"检测到 {len(snap.values['failed_blocks'])} 个失败块，倒带补跑……")
                 graph.update_state(config, {"retry_round": 0}, as_node="aggregate")

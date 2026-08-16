@@ -12,6 +12,7 @@ Design points:
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -141,7 +142,12 @@ class LLMClient:
                     self._total_tokens += tokens
                     self._total_requests += 1
                 return data["choices"][0]["message"]["content"]
-            except (httpx.HTTPError, LLMError) as e:  # httpx timeouts included
+            except (httpx.HTTPError, LLMError, json.JSONDecodeError,
+                    IndexError, KeyError) as e:
+                # httpx timeouts included. JSONDecodeError/IndexError/KeyError
+                # cover malformed success responses (invalid JSON body, empty
+                # choices, missing keys) — transient proxy glitches worth
+                # retrying, not permanent failures.
                 last_err = e
                 if attempt < self.max_retries - 1:
                     time.sleep(0.5 * 2 ** attempt)

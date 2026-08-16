@@ -109,3 +109,37 @@ review:
     assert "## ##" not in md  # regression guard for the double-heading bug
     assert (run_dir / "project_map.json").exists()
     assert (run_dir / "checkpoints.sqlite").exists()
+
+
+def test_cli_same_thread_id_different_path_fails(tmp_path, sample_project, mock_server):
+    """同 thread-id 换目标路径必须拒绝续跑，不能拿 A 项目的 checkpoint 当 B 的结果。"""
+    config = tmp_path / "config.yaml"
+    config.write_text(f"""default_profile: mock
+profiles:
+  mock:
+    base_url: "http://127.0.0.1:{mock_server}/v1"
+    api_key_env: "MOCK_KEY"
+    model: "mock-model"
+    temperature: 0.2
+    max_tokens: 4096
+    context_length: 8192
+    timeout: 30
+review:
+  second_profile: null
+  concurrency: 4
+""", encoding="utf-8")
+
+    # 第一次跑项目 A，正常完成并留下 checkpoint
+    r1 = _run_cli(sample_project, config, "itest-path", cwd=tmp_path)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+
+    # 换一个项目 B，复用同一个 thread-id：必须报错退出
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "app.py").write_text("# clean\nx = 1\n", encoding="utf-8")
+
+    r2 = _run_cli(other, config, "itest-path", cwd=tmp_path)
+    assert r2.returncode != 0
+    combined = r2.stdout + r2.stderr
+    assert "不一致" in combined
+    assert "--thread-id" in combined

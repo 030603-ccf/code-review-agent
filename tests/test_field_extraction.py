@@ -5,6 +5,7 @@ import pytest
 
 from lra.llm.structured import (
     StructuredOutputError,
+    _extract_json,
     chat_structured,
     extract_findings_from_text,
 )
@@ -25,7 +26,7 @@ def test_chinese_critical_with_line():
     assert f["severity"] == "critical"
     assert f["line_start"] == 3 and f["line_end"] == 3
     assert f["file_path"] == ""
-    assert f["category"] == "best_practice"  # no category keyword -> default
+    assert f["category"] == "security"  # "SQL注入" is a concrete security term
     assert f["confidence"] == 0.7
     assert f["evidence"] == ""  # never hard-extracted
 
@@ -100,6 +101,31 @@ def test_no_keywords_returns_none():
     assert extract_findings_from_text("请审查以下文件：a.py") is None
     assert extract_findings_from_text("") is None
     assert extract_findings_from_text("   ") is None
+
+
+def test_correctness_category_extraction():
+    f = _findings("第3行存在正确性问题，级别高")[0]
+    assert f["category"] == "correctness"
+    assert f["severity"] == "high"
+    assert f["line_start"] == 3
+
+
+def test_mixed_prose_not_judged_empty():
+    # "函数A没问题" matches the no-issue pattern, but the text still names a
+    # real SQL-injection finding — it must not be zeroed out.
+    fs = _findings("函数A没问题，但函数B第3行有SQL注入")
+    assert len(fs) == 1
+    assert fs[0]["category"] == "security"
+    assert fs[0]["line_start"] == 3
+
+
+def test_extract_json_mixed_prose_raises_not_empty():
+    with pytest.raises(ValueError):
+        _extract_json("函数A没问题，但函数B第3行有SQL注入")
+
+
+def test_extract_json_pure_no_issue_still_empty():
+    assert _extract_json("代码没有问题，可以合入。") == '{"findings": []}'
 
 
 # --- chat_structured integration ---------------------------------------------

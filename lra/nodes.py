@@ -10,6 +10,8 @@ top of it we retry transient errors with exponential backoff.
 """
 
 import concurrent.futures
+import copy
+import hashlib
 import json
 import re
 import time
@@ -89,6 +91,25 @@ def _parse_error_findings(files: list[dict]) -> list[Finding]:
             confidence=1.0,
         ))
     return out
+
+
+def _chunk_cache_context(base_context: str, entry: dict) -> str:
+    """把 dep_context 与 LSP 候选纳入缓存键维度。
+
+    review_chunk 的 prompt 会注入 ``entry["_dep_context"]``（依赖文件符号）和
+    ``entry["_lsp_candidates"]``（LSP warning 候选）。这两者会改变 reviewer 输出，
+    却既不在文件 sha1 里、也不在全局 ``context`` 指纹里：依赖文件改了 / 换 LSP
+    服务器，本文件 sha1 不变，旧缓存照样命中过期结果。这里把二者内容哈希拼进
+    缓存键的 context 维度，让依赖图 / LSP 配置变化使缓存失效；二者都为空时保持
+    原 context 不变（与旧键兼容，不整体失效）。
+    """
+    dep = entry.get("_dep_context") or ""
+    lsp = entry.get("_lsp_candidates") or ""
+    if not dep and not lsp:
+        return base_context
+    extra = hashlib.sha256(
+        ("\x00".join((dep, lsp))).encode("utf-8")).hexdigest()[:16]
+    return f"{base_context}\x00dep_lsp:{extra}"
 
 
 def _incremental_filter(files: list[dict], diff_set: set[str]) -> list[dict]:
@@ -218,10 +239,13 @@ class Nodes:
         relpath = entry.get("relpath") or chunk.get("file", "")
         sha1 = entry.get("sha1", "")
         model = self.client.config.model
+        # 缓存键 context 维度 = 全局指纹 + dep_context/LSP 候选的内容哈希。
+        # 依赖图变化或换 LSP 服务器会让缓存 miss，重新审查。
+        cache_ctx = _chunk_cache_context(self.context, entry)
         if self.cache is not None:
             cached = self.cache.get(relpath, sha1,
                                     chunk["line_start"], chunk["line_end"], model,
-                                    context=self.context)
+                                    context=cache_ctx)
             if cached is not None:
                 logger.done(tag=tag + "（缓存命中）", findings=len(cached))
                 return {"findings": cached}
@@ -242,12 +266,9 @@ class Nodes:
                 err = classify_error(e)
                 if isinstance(err, PermanentError):
                     logger.fail(f"{tag} 永久错误：{type(e).__name__}: {e}")
-                    # 永久错误也缓存（存工具发现）：重复跑时跳过 LLM 不再重试，
-                    # 避免每次对同一个 JSON 输出失败的文件白烧 token。
-                    if self.cache is not None:
-                        self.cache.put(relpath, sha1,
-                                       chunk["line_start"], chunk["line_end"],
-                                       tool_findings, model, context=self.context)
+                    # 永久错误（JSON 输出失败）**不进缓存**：此时只有 tool_findings
+                    # / 空清单，若写缓存，后续 run 会把它当完整命中、该块 LLM 审查
+                    # 永久丢失。只有成功（LLM 返回合法 findings）才 put 缓存。
                     return {"findings": tool_findings}
                 if attempt >= MAX_RETRIES:
                     break
@@ -258,7 +279,7 @@ class Nodes:
             if self.cache is not None:
                 self.cache.put(relpath, sha1,
                                chunk["line_start"], chunk["line_end"],
-                               all_findings, model, context=self.context)
+                               all_findings, model, context=cache_ctx)
             logger.done(tag=tag, findings=len(all_findings),
                         tool=len(tool_findings), llm=len(fs))
             return {"findings": all_findings}
@@ -280,6 +301,7 @@ class Nodes:
         relpath = entry.get("relpath") or chunk.get("file", "")
         sha1 = entry.get("sha1", "")
         model = self.client.config.model
+        cache_ctx = _chunk_cache_context(self.context, entry)
         for attempt in range(MAX_RETRIES + 1):
             try:
                 fs = do_review_chunk(self.client, entry, chunk,
@@ -289,10 +311,8 @@ class Nodes:
                 err = classify_error(e)
                 if isinstance(err, PermanentError):
                     logger.fail(f"{tag} 补跑永久错误：{type(e).__name__}: {e}")
-                    if self.cache is not None:
-                        self.cache.put(relpath, sha1,
-                                       chunk["line_start"], chunk["line_end"],
-                                       [], model, context=self.context)
+                    # 永久错误不进缓存（与 review_chunk 一致：只有成功才 put），
+                    # 否则空清单会被当成完整命中、该块审查永久丢失。
                     break
                 if attempt >= MAX_RETRIES:
                     break
@@ -303,15 +323,19 @@ class Nodes:
             if self.cache is not None:
                 self.cache.put(relpath, sha1,
                                chunk["line_start"], chunk["line_end"],
-                               findings, model, context=self.context)
+                               findings, model, context=cache_ctx)
             logger.done(tag=tag, findings=len(findings))
             return {"findings": findings, "retry_round": payload["round"] + 1,
                     "failed_blocks": [{"entry": entry, "chunk": chunk, "resolved": True}]}
 
         logger.fail(f"{tag} 补跑失败：{type(last_err).__name__}: {last_err}")
-        # mark resolved regardless so the ledger can't loop forever
+        # 补跑仍失败：不标 resolved。账本保留该块，等下次 --retry-failed 再试。
+        # 单次 run 内不会死循环：fan_out_failed 用 MAX_RETRY_ROUNDS 封顶，
+        # retry_round+1 之后不再路由到 retry_failed。旧实现这里也标 resolved，
+        # 导致跑完后 failed_blocks 恒为空，--retry-failed 永远找不到可补跑的块。
         return {"findings": [], "retry_round": payload["round"] + 1,
-                "failed_blocks": [{"entry": entry, "chunk": chunk, "resolved": True}]}
+                "failed_blocks": [{"entry": entry, "chunk": chunk,
+                                   "error": f"{type(last_err).__name__}: {str(last_err)[:200]}"}]}
 
     # ---- aggregate ----
     def aggregate(self, state: dict) -> dict:
@@ -361,8 +385,12 @@ class Nodes:
 
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=SECOND_REVIEW_WORKERS)
         try:
-            futures = {ex.submit(do_second_review, items, state["root"],
-                                 self.second_client, None): relpath
+            # 终审线程竞态：do_second_review 会就地改写 Finding 对象。超时线程
+            # （shutdown(wait=False) 后继续跑）若改的是原对象，主线程收集结果 /
+            # 序列化时会被同时改写（verdict 与错题本写入竞态）。这里给 worker
+            # 传深拷贝：超时线程改的是副本，主线程用原对象标 uncertain，互不影响。
+            futures = {ex.submit(do_second_review, copy.deepcopy(items),
+                                 state["root"], self.second_client, None): relpath
                        for relpath, items in by_file.items()}
             done, not_done = concurrent.futures.wait(futures,
                                                      timeout=SECOND_REVIEW_TIMEOUT)

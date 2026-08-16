@@ -84,6 +84,8 @@ class ApiFixer:
         code = extract_code_block(reply)
         if code is None:
             return self._fail(task, "回复里没有代码块")
+        if not code.strip():
+            return self._fail(task, "生成的代码为空")
 
         # compile 语法闸门只对 .py 生效，其他语言跳过
         if _lang_of(task.file_path) == "py" and not python_compiles(code, task.file_path):

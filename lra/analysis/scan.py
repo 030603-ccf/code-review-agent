@@ -14,10 +14,6 @@ from lra.analysis.languages import LANG_BY_EXT, extract_symbols
 from lra.ignore import path_is_ignored
 
 
-def _sha1(path: Path) -> str:
-    return hashlib.sha1(path.read_bytes()).hexdigest()
-
-
 def _signature_of(node) -> str:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         ret = f" -> {ast.unparse(node.returns)}" if node.returns else ""
@@ -79,11 +75,15 @@ def _extract(tree: ast.AST) -> tuple[list[dict], list[str]]:
 
 
 def scan_file(path: Path, relpath: str) -> dict:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # 一次读盘：字节 → sha1 / 大小，再解码成文本 → 行数。旧实现 read_text +
+    # read_bytes + stat 三趟 I/O；大项目下是纯浪费，且 sha1 与 text 可能读到
+    # 不同快照（文件在两次读之间被改），导致缓存键与实际文本不一致。
+    data = path.read_bytes()
+    text = data.decode("utf-8", errors="replace")
     entry = {
         "relpath": relpath,
-        "sha1": _sha1(path),
-        "size_bytes": path.stat().st_size,
+        "sha1": hashlib.sha1(data).hexdigest(),
+        "size_bytes": len(data),
         "line_count": len(text.splitlines()),
         "symbols": [], "imports": [], "parse_error": None,
     }

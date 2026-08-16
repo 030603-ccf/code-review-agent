@@ -102,6 +102,33 @@ def test_diagnose_parses_content_length_framing(tmp_path):
     assert diags[3]["severity"] == 4
 
 
+def test_wait_buffers_nonmatching_messages():
+    """_wait 不能丢弃未匹配消息：initialize 响应之前若先到了一条
+    publishDiagnostics 通知，后续 diagnose 的 _wait 仍要能找到它（旧实现
+    会把它当噪声丢掉，导致 diagnose 等到超时）。"""
+    client = LspClient([sys.executable, "-c", "import time; time.sleep(60)"],
+                       timeout=1)
+    try:
+        # 不启动进程，直接向队列塞消息模拟「通知先到、响应后到」。
+        client._messages.put({
+            "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": {"uri": "file:///a.py",
+                       "diagnostics": [{"severity": 1, "message": "boom"}]},
+        })
+        client._messages.put({"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        # 等 id==1 的响应：途中吃进的 publishDiagnostics 必须被缓冲而非丢弃
+        resp = client._wait(lambda m: m.get("id") == 1)
+        assert resp.get("id") == 1
+
+        # 被缓冲的通知还能被后续 _wait 找到（旧实现这里会等满超时抛 LspError）
+        diag = client._wait(
+            lambda m: m.get("method") == "textDocument/publishDiagnostics")
+        assert diag["params"]["diagnostics"][0]["message"] == "boom"
+    finally:
+        client.close()
+
+
 def test_lsp_findings_keeps_only_error_level(tmp_path):
     """error（severity==1）直接保留为 finding；warning/info/hint 不进 finding。"""
     server = _write_server(tmp_path)

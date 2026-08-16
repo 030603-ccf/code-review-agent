@@ -47,6 +47,9 @@ class LspClient:
         self.proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._messages: queue.Queue = queue.Queue()
+        # 被 _wait 读走但未匹配的消息缓冲：不同 predicate 的等待会共享同一条
+        # 消息流，直接丢弃未匹配消息会导致后续 _wait 永远等不到它。
+        self._pending: list = []
         self._next_id = 1
 
     # ---- process lifecycle ----
@@ -121,10 +124,21 @@ class LspClient:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
     def _wait(self, predicate, timeout: float | None = None) -> dict:
-        """Block until a queued message satisfies ``predicate`` (or timeout)."""
+        """Block until a queued message satisfies ``predicate`` (or timeout).
+
+        未匹配的消息不丢弃，而是放进 ``_pending`` 缓冲：语言服务器可能在请求
+        与其响应之间插一条 ``publishDiagnostics`` / ``window/logMessage`` 通知。
+        旧实现直接把它们丢掉，等后续 ``_wait`` 再来找这条通知时早已错过、只能
+        等到超时。
+        """
         timeout = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
         while True:
+            # 先扫缓冲：之前 _wait 吃进来但没匹配上的消息，可能正是本次要找的。
+            for i, buffered in enumerate(self._pending):
+                if predicate(buffered):
+                    self._pending.pop(i)
+                    return buffered
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise LspError(f"等待语言服务器响应超时（>{timeout:.0f}s）")
@@ -136,6 +150,7 @@ class LspClient:
                 raise LspError("语言服务器意外退出")
             if predicate(msg):
                 return msg
+            self._pending.append(msg)
 
     # ---- LSP operations ----
     def _workspace_root_uri(self) -> str:

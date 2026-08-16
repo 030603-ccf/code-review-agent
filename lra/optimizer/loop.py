@@ -179,6 +179,16 @@ def optimize_loop(run_dir, copy_root, findings, state, fixer,
 
     backend = getattr(fixer, "backend", "api")
     model = getattr(fixer, "model", "") or ""
+    # 断点续跑：findings.json 重新生成时 id 可能漂移（F1..Fn 顺序变），
+    # 把旧 opt_state 里没有的新 id 合并注册为 pending，避免后面 set_finding_status
+    # 对未知 id 抛 KeyError。
+    for f in findings:
+        state.data["findings"].setdefault(f.id, {
+            "status": "pending",
+            "file": f.file_path,
+            "severity": getattr(f, "severity", ""),
+            "title": getattr(f, "title", ""),
+        })
     # 断点续跑：remaining 只含还没 verified 的 finding；已确认修好的跳过，
     # 不再重复修。state.data["findings"] 是 {fid: {status, file, severity, title}}。
     remaining = {f.id for f in findings
@@ -192,7 +202,7 @@ def optimize_loop(run_dir, copy_root, findings, state, fixer,
             if rec.get("status") == "verified":
                 keep.setdefault(f.file_path, []).append(f"{f.id} {f.title}")
 
-        feedback = {fid: state.data["findings"][fid].get("note", "")
+        feedback = {fid: state.data["findings"].get(fid, {}).get("note", "")
                     for fid in remaining}
         to_fix = [f for f in findings if f.id in remaining]
         round_files: list[str] = []

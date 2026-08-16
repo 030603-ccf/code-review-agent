@@ -10,8 +10,10 @@ runs/), guarded by a lock because review_chunk nodes run in parallel.
 """
 
 import json
+import os
 import threading
 import time
+import uuid
 from pathlib import Path
 
 # 审查 prompt/schema 版本：改 reviewer prompt 或 Finding schema 时 +1，
@@ -84,9 +86,20 @@ class FindingCache:
 
     def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
+        # 固定 .tmp 名会让两个并发 run 的 replace 互相竞争（FileNotFoundError
+        # 被误判为保存失败）。tmp 名带上 PID + 随机后缀，每个进程/每次落盘
+        # 各自写自己的临时文件，replace 是原子的最后一步。
+        tmp = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False),
                        encoding="utf-8")
-        tmp.replace(self.path)
+        try:
+            tmp.replace(self.path)
+        except OSError:
+            # tmp 消失 = 并发 run 已抢先 replace 完成；视为已写，静默清理残片。
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         self._dirty = False
         self._last_save = time.monotonic()

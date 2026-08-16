@@ -723,3 +723,154 @@ def test_cmd_optimize_first_run_creates_workspace_and_registers(tmp_path, monkey
     assert kw["state"].data["findings"]["F1"]["status"] == "pending"
     assert kw["cache"].path == run_dir / "fix_cache.json"
     assert (run_dir / "opt_state.json").is_file()  # 首次已落盘
+
+
+# ---------- 第三轮评审回归：build 放行 / fixer 空块 / 续跑漂移 / cmd 193 ----------
+
+def test_build_can_verify_whitelist():
+    """build 模式只放行语法类标题 + best_practice；performance/readability 不放行。"""
+    from lra.optimizer.verifier import _build_can_verify
+
+    # best_practice：lint 可覆盖 → 可 verify
+    assert _build_can_verify(_finding(fid="F1")) is True  # category=best_practice
+
+    # 语法类标题：即便 category=correctness 也可 verify
+    assert _build_can_verify(Finding(
+        id="F2", category="correctness", severity="critical",
+        file_path="a.py", line_start=1, line_end=1,
+        title="语法解析失败", description="", evidence="", suggestion="",
+        confidence=1.0)) is True
+
+    # performance / readability / security / correctness（非语法标题）→ 不可 verify
+    for cat in ("performance", "readability", "security", "correctness"):
+        f = Finding(id="F3", category=cat, severity="high",
+                    file_path="a.py", line_start=1, line_end=1,
+                    title="some issue", description="", evidence="",
+                    suggestion="", confidence=0.9)
+        assert _build_can_verify(f) is False, f"{cat} 不应被 build 放行"
+
+
+def test_verify_fixes_build_mode_does_not_verify_performance(tmp_path, monkeypatch):
+    """build 通过时 performance/readability 也不标 verified，改标 remaining 等 llm。"""
+    copy_root = tmp_path / "copy"
+    (copy_root / "src").mkdir(parents=True)
+    (copy_root / "src" / "a.py").write_text("x = 2\n", encoding="utf-8")
+    findings = [Finding(
+        id="F1", category="performance", severity="medium",
+        file_path="src/a.py", line_start=1, line_end=1,
+        title="低效循环", description="O(n^2)", evidence="", suggestion="",
+        confidence=0.8,
+    )]
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings(findings)
+    st.set_finding_status("F1", "fixed")
+
+    from lra.optimizer import verifier as v
+    monkeypatch.setattr(v, "run_build_check",
+                        lambda *a, **k: v.BuildCheckResult(passed=True, command="ruff check"))
+    summary = verify_fixes(tmp_path / "run", copy_root, None, st, findings,
+                           round_files={"src/a.py"}, mode="build")
+    assert summary["verified"] == []
+    assert summary["remaining"] == ["F1"]
+    assert st.data["findings"]["F1"]["status"] == "remaining"
+    assert "llm 复查" in st.data["findings"]["F1"]["note"]
+
+
+def test_api_fixer_rejects_empty_code_block(tmp_path):
+    """模型回复空代码围栏时不得清空文件：判 failed，文件保持原样。"""
+    copy_root = tmp_path / "copy"
+    (copy_root / "src").mkdir(parents=True)
+    target = copy_root / "src" / "a.py"
+    target.write_text("print('old')\n", encoding="utf-8")
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings([_finding(file_path="src/a.py")])
+    finding = _finding(file_path="src/a.py")
+
+    # 空 python 围栏：extract 返回空串，compile 闸门会放行，必须在写盘前拦下
+    empty = ApiFixer(FakeClient("```python\n\n```"), copy_root, state=st)
+    assert not empty.apply(FixTask("src/a.py", [finding], "task"))
+    assert target.read_text(encoding="utf-8").strip() == "print('old')"  # 文件没动
+    assert st.data["findings"]["F1"]["status"] == "failed"
+    assert "空" in st.data["findings"]["F1"]["note"]
+
+    # 无语言围栏的空块同样拦截
+    empty2 = ApiFixer(FakeClient("```\n\n```"), copy_root, state=st)
+    assert not empty2.apply(FixTask("src/a.py", [finding], "task"))
+    assert target.read_text(encoding="utf-8").strip() == "print('old')"
+
+
+def test_loop_resume_drifted_ids_merge_and_no_keyerror(tmp_path):
+    """断点续跑 id 漂移：新 findings 含旧 opt_state 没有的 id，合并注册为 pending，
+    feedback 用 .get() 兜底，不再 KeyError 崩循环。"""
+    copy_root = tmp_path / "copy"
+    (copy_root / "src").mkdir(parents=True)
+    target = copy_root / "src" / "a.py"
+    target.write_text("print('bad')\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+
+    # 旧 opt_state 只认识 F1（已 verified）；新 findings 重新生成了 id → F2 是陌生 id
+    st = OptState(str(tmp_path), str(copy_root))
+    st.register_findings([_finding(fid="F1", file_path="src/a.py")])
+    st.set_finding_status("F1", "verified", "done")
+    findings = [_finding(fid="F2", file_path="src/a.py")]
+
+    class DriftFixer:
+        backend = "api"
+        model = "fake-model"
+
+        def __init__(self, copy_root, state):
+            self.copy_root = copy_root
+
+        def apply(self, task):
+            (self.copy_root / task.file_path).write_text(
+                "print('fixed')\n", encoding="utf-8")
+            return True
+
+    class DriftClient:
+        config = type("Cfg", (), {"model": "fake-model"})()
+        def chat(self, messages, **kwargs):
+            return '{"verdicts": [{"finding_id": "F2", "still_exists": false, "reason": "gone"}]}'
+
+    result = optimize_loop(run_dir, copy_root, findings, st,
+                           DriftFixer(copy_root, st), review_client=DriftClient(),
+                           max_rounds=1)
+    assert result["verified"] == ["F2"]
+    assert st.data["findings"]["F1"]["status"] == "verified"  # 旧记录保留
+    assert st.data["findings"]["F2"]["status"] == "verified"  # 新 id 被注册并修好
+
+
+def test_run_build_check_routes_cmd_bat_through_cmd(monkeypatch, tmp_path):
+    """.cmd/.bat 命令在 Windows 上走 cmd /c 转交，避免 WinError 193。"""
+    import lra.optimizer.verifier as v
+    monkeypatch.setattr(v.os, "name", "nt")
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    monkeypatch.setattr(v.subprocess, "run", fake_run)
+    monkeypatch.setattr(v.shutil, "which",
+                        lambda name, path=None: "C:\\bin\\ruff.cmd")
+    result = v.run_build_check(tmp_path, command="ruff check")
+    assert result.passed and not result.skipped
+    assert captured["argv"][:2] == ["cmd", "/c"]
+    assert captured["argv"][2].lower().endswith("ruff.cmd")
+
+
+def test_run_build_check_oserror_treated_as_skipped(monkeypatch, tmp_path):
+    """subprocess.run 抛 OSError（如 WinError 193）时按 skipped 处理，不崩。"""
+    import lra.optimizer.verifier as v
+    monkeypatch.setattr(v.os, "name", "nt")
+
+    def fake_run(argv, **kw):
+        raise OSError(193, "not a valid Win32 application")
+    monkeypatch.setattr(v.subprocess, "run", fake_run)
+    monkeypatch.setattr(v.shutil, "which",
+                        lambda name, path=None: "C:\\bin\\ruff.cmd")
+    result = v.run_build_check(tmp_path, command="ruff check")
+    assert result.skipped and result.passed  # OSError → skipped，不算失败

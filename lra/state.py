@@ -4,15 +4,23 @@ Reducers:
   - findings:      operator.add (parallel reviewers append)
   - failed_blocks: custom — dedupe by (file, line range), drop "resolved"
                    entries so a retried block is never re-run.
-  - retry_round:   max (parallel retry nodes all write round+1)
+  - retry_round:   overwrite (parallel retry nodes all write round+1, so last
+                   write wins; overwrite also lets --retry-failed reset to 0)
 """
 
 import operator
 from typing import Annotated, TypedDict
 
 
-def _max_int(a: int, b: int) -> int:
-    return a if a > b else b
+def _retry_round_reducer(a: int, b: int) -> int:
+    """合并 retry_round：覆盖语义（last-write-wins）。
+
+    并行 retry_failed 节点写的是同一个 ``round+1``（fan_out_failed 给每个节点
+    传同一个 round），所以覆盖与 max 在正常跑批里等价；但覆盖额外允许
+    ``--retry-failed`` 倒带时显式写回更小的 0 来重置轮次——旧 ``max`` reducer
+    会把它卡在 1，倒带永远无法重触发 retry_failed。
+    """
+    return b
 
 
 def _block_key(item: dict) -> tuple:
@@ -58,7 +66,7 @@ class ReviewState(TypedDict, total=False):
     # parallel review accumulation
     findings: Annotated[list[dict], operator.add]
     failed_blocks: Annotated[list[dict], _merge_failed]
-    retry_round: Annotated[int, _max_int]
+    retry_round: Annotated[int, _retry_round_reducer]
 
     # aggregate / second_review / report
     aggregated: list[dict]

@@ -52,7 +52,11 @@ def _extract_json(text: str) -> str:
     start, end = t.find("{"), t.rfind("}")
     if start != -1 and end != -1 and end > start:
         return t[start:end + 1]
-    if _NO_ISSUE_RE.search(t):
+    # A "no findings" prose answer is only trusted when it carries no
+    # category/severity vocabulary at all. Mixed prose like "函数A没问题，
+    # 但函数B第3行有SQL注入" matches the no-issue pattern yet still names a
+    # real finding — raise instead so the prose-extraction layer can salvage it.
+    if _NO_ISSUE_RE.search(t) and not (_scan_categories(t) or _scan_severities(t)):
         return '{"findings": []}'
     raise ValueError("no JSON object found")
 
@@ -81,11 +85,20 @@ def _repair(text: str) -> str:
 # English boundaries use ASCII lookarounds, not \b: CJK chars are \w in
 # Python, so \b would not fire between e.g. "度" and "critical".
 _CATEGORY_ALIASES: dict[str, tuple[re.Pattern, tuple[str, ...]]] = {
-    "security": (re.compile(r"(?<![A-Za-z])security(?![A-Za-z])"), ("安全",)),
+    # "SQL注入"/"SQL 注入"/"命令注入" are concrete security defects: without
+    # them, mixed prose like "函数A没问题，但函数B有SQL注入" carries no
+    # category keyword and would be zeroed out by the "no findings" shortcut
+    # in _extract_json.
+    "security": (
+        re.compile(r"(?<![A-Za-z])security(?![A-Za-z])"),
+        ("安全", "SQL注入", "SQL 注入", "命令注入"),
+    ),
     "performance": (re.compile(r"(?<![A-Za-z])performance(?![A-Za-z])"), ("性能",)),
     "readability": (re.compile(r"(?<![A-Za-z])readability(?![A-Za-z])"), ("可读性",)),
     "best_practice": (
         re.compile(r"(?<![A-Za-z])best\s*_?practice(?![A-Za-z])"), ("最佳实践",)),
+    "correctness": (
+        re.compile(r"(?<![A-Za-z])correctness(?![A-Za-z])"), ("正确性",)),
 }
 
 _SEVERITY_ALIASES: dict[str, tuple[re.Pattern, tuple[re.Pattern, ...]]] = {
