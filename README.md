@@ -125,16 +125,20 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 注：human-eval（163 文件）二审 `deepseek-v4-pro` 约需 253s 跑完——已把二审超时从固定 120s 改为随文件数伸缩（`SECOND_REVIEW_PER_CALL_SECONDS`），大项目不再被误标「终审超时」。初审结果进 sha1 缓存，重跑二审只花 ~189k token、0 初审请求。
 
-### 模型对比（行级召回，deepseek-v4-flash vs qwen3.7-flash）
+### 模型对比（行级召回，deepseek-v4-flash vs qwen3.7-flash，2026-08-17 清理重测）
 
-| 基准 | deepseek-v4-flash（开思考） | qwen3.7-flash（无思考） |
-| --- | --- | --- |
-| quixbugs Java | 92.5% | 75.0% |
-| quixbugs Python | 77.5% | 65.0% |
-| human-eval Java | 89.0% | 83.4% |
-| msr20 漏洞检出 | 2/3 | 2/3 |
+两列都是**清空错题本 + sha1 缓存后的同口径干净跑分**（初审 `*-flash` 开思考 / `qwen3.7-flash` 无思考，二审 `*-pro` / `qwen3.7-plus`）：
 
-注：两列**非同口径**——DeepSeek 列开了思考、Qwen 列没开。DeepSeek 无思考时 Java 仅 55%、Python 60%，反而比 Qwen 无思考（75%/65%）更低；真正的分水岭是「开思考」而非模型本身。Qwen 若支持思考并开启，需重测后才能下结论（当前 Qwen 免费额度已耗尽，见下）。
+| 基准 | deepseek-v4-flash（开思考） | qwen3.7-flash（无思考） | Qwen 二审通过率 |
+| --- | --- | --- | --- |
+| quixbugs Java | 92.5% | 77.5% | 96/114 = 84.2% |
+| quixbugs Python | 77.5% | 62.5% | 58/69 = 84.1% |
+| human-eval Java | 89.0% | 90.8% | 492/702 = 70.1% |
+| msr20 漏洞检出 | 2/3 | 3/3 | 6/7 = 85.7% |
+
+注 1：DeepSeek 全面开思考、Qwen 未开思考（Qwen profile 未配 `thinking`，见 `config.yaml`），两列仍**非同口径**。DeepSeek 无思考时 Java 仅 55%、Python 60%，反而比 Qwen 无思考更低；真正的分水岭是「开思考」而非模型本身。
+注 2：Qwen 结果**非确定**——同一数据集多次跑分 ±10pp 波动（Java 65~77.5%、Python 62.5~75%），单次跑分不具统计意义；DeepSeek 同样有波动但明显更稳。对比结论以多次跑分中位数为准，勿拿单次数字下结论。
+注 3：msr20 只有 3 个 CVE 样本，2/3 vs 3/3 无统计意义，仅作参考。human-eval Java 上 Qwen 行级召回略高于 DeepSeek 属波动范围内。
 
 ### 优化演进（每次改动的效果）
 
