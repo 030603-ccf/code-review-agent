@@ -127,17 +127,17 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 ### 模型对比（行级召回，deepseek-v4-flash vs qwen3.7-flash，2026-08-17 清理重测）
 
-两列都是**清空错题本 + sha1 缓存后的同口径干净跑分**（初审 `*-flash` 开思考 / `qwen3.7-flash` 无思考，二审 `*-pro` / `qwen3.7-plus`）：
+两列都是**清空错题本 + sha1 缓存后的同口径干净跑分**（DeepSeek 列开思考，Qwen 列思考开关无影响——实测一致，见注 1；二审 `*-pro` / `qwen3.7-plus`）：
 
-| 基准 | deepseek-v4-flash（开思考） | qwen3.7-flash（无思考） | qwen3.7-flash（开思考） | Qwen 二审通过率 |
-| --- | --- | --- | --- | --- |
-| quixbugs Java | 92.5% | 77.5% | 77.5% | 94/111 = 84.7% |
-| quixbugs Python | 77.5% | 62.5% | — | 58/69 = 84.1% |
-| human-eval Java | 89.0% | 90.8% | — | 492/702 = 70.1% |
-| msr20 漏洞检出 | 2/3 | 3/3 | — | 6/7 = 85.7% |
+| 基准 | deepseek-v4-flash（开思考） | qwen3.7-flash | Qwen 二审通过率 |
+| --- | --- | --- | --- |
+| quixbugs Java | 92.5% | 77.5% | 96/114 = 84.2% |
+| quixbugs Python | 77.5% | 62.5% | 58/69 = 84.1% |
+| human-eval Java | 89.0% | 90.8% | 492/702 = 70.1% |
+| msr20 漏洞检出 | 2/3 | 3/3 | 6/7 = 85.7% |
 
-注 1：**Qwen 开思考对 quixbugs Java 零提升**（77.5%→77.5%，连漏报的 9 个文件都逐一同款）——思考模式提升检出率在 Qwen 上不成立，这与 DeepSeek 开思考 +35pp 形成鲜明对比。疑因：Qwen 无思考时已足够「多想」，思考 token 只是把同一结论写得更啰嗦（本跑分初审 48 请求 · 261k token，与无思考 266k 几乎持平，未见思考带来的额外推理量）。结论仍是「开思考提升的是 DeepSeek 的短板，而非所有模型」。
-注 2：DeepSeek 全面开思考、Qwen 列仍**非同口径**（Qwen 开思考无收益，故其余数据集未重测）。DeepSeek 无思考时 Java 仅 55%、Python 60%，反而比 Qwen 无思考更低。
+注 1：**Qwen 思考开关无影响，已实证**——quixbugs Java 用 `extra_body: {"enable_thinking": true}` 重测（probe 确认返回 reasoning_content），行级召回 77.5% 与无思考完全一致，连漏报的 9 个文件（DETECT_CYCLE/GET_FACTORS/LIS/NEXT_PALINDROME/NEXT_PERMUTATION/POSSIBLE_CHANGE/REVERSE_LINKED_LIST/SUBSEQUENCES/WRAP）都逐一同款；初审 token 也几乎持平（开思考 261k vs 无思考 266k）。即 Qwen 无思考时已隐含等价推理，思考模式只是把同一结论写得更啰嗦。因此其余数据集沿用无思考跑分，无需逐个开思考重测。
+注 2：**开思考收益是模型相关的**——DeepSeek 开思考 +35pp（57.5%→92.5%），Qwen 开思考 +0pp。真正的分水岭是「模型本身能力 + 是否开思考」的组合，不能只归因于思考开关。
 注 3：Qwen 结果**非确定**——同一数据集多次跑分 ±10pp 波动（Java 65~77.5%、Python 62.5~75%），单次跑分不具统计意义；DeepSeek 同样有波动但明显更稳。对比结论以多次跑分中位数为准，勿拿单次数字下结论。
 注 4：msr20 只有 3 个 CVE 样本，2/3 vs 3/3 无统计意义，仅作参考。human-eval Java 上 Qwen 行级召回略高于 DeepSeek 属波动范围内。
 
