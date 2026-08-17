@@ -125,9 +125,9 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 注：human-eval（163 文件）二审 `deepseek-v4-pro` 约需 253s 跑完——已把二审超时从固定 120s 改为随文件数伸缩（`SECOND_REVIEW_PER_CALL_SECONDS`），大项目不再被误标「终审超时」。初审结果进 sha1 缓存，重跑二审只花 ~189k token、0 初审请求。
 
-### 模型对比（行级召回，deepseek-v4-flash vs qwen3.7，2026-08-17 清理重测）
+### 模型对比（行级召回，deepseek-v4-flash vs qwen3.7 系列，2026-08-17 清理重测）
 
-两列都是**清空错题本 + sha1 缓存后的同口径干净跑分**（DeepSeek 列开思考；Qwen 列思考开关无影响——实测一致，见注 1；二审 `*-pro` / `qwen3.7-plus`）：
+所有数字都是**清空错题本 + sha1 缓存后的同口径干净跑分**（DeepSeek 列开思考；Qwen flash 思考开关无影响——实测一致，见注 1；二审 `*-pro` / `qwen3.7-plus`）：
 
 | 基准 | deepseek-v4-flash（开思考） | qwen3.7-flash | qwen3.7-max-preview（开思考） | Qwen 二审通过率 |
 | --- | --- | --- | --- | --- |
@@ -141,6 +141,19 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 注 2：**开思考收益是模型相关的**——DeepSeek 开思考 +35pp（57.5%→92.5%），Qwen flash 开思考 +0pp。但 qwen3.7-max 是例外：它开思考 + 模型档位更高，达到 92.5%。真正的分水岭是「模型本身能力 + 是否开思考」的组合。
 注 3：Qwen 结果**非确定**——flash 同一数据集多次跑分 ±10pp 波动（Java 65~77.5%、Python 62.5~75%），单次跑分不具统计意义；max 仅跑 1 次，建议复测确认稳定性。DeepSeek 同样有波动但明显更稳。
 注 4：msr20 只有 3 个 CVE 样本，2/3 vs 3/3 无统计意义，仅作参考。human-eval Java 上 Qwen flash 行级召回略高于 DeepSeek 属波动范围内。
+注 5：**qwen3.7-plus 已排除**（2026-08-17 实测）——plus 开思考后单次大代码请求 40s+（reasoning 极长），16 并发下请求挂起（`read timeout 90s` 因服务器持续 flush 永不触发，进程 CPU≈0 空等）；关思考后仍复现挂起，后确认是 API 余额耗尽所致，但充值后重新开思考跑分依旧极慢、无法在合理时间内完成。结论：plus 档位不适合本项目的初审，保留作二审仲裁用（`config.yaml` 已加注）。
+
+### 模型成本对比（元/百万 tokens，2026-08-17 官方定价）
+
+| 模型 | 输入 | 输出 | 备注 |
+| --- | --- | --- | --- |
+| deepseek-v4-flash | 1.5（缓存命中 0.05） | 4.5 | 空闲时段价；高峰 9:00/14:00 翻倍（输入 3.0 / 输出 9.0） |
+| deepseek-v4-pro | 4.5（缓存命中 0.15） | 13.5 | 同上，高峰 9.0 / 27.0 |
+| qwen3.7-flash | 0.2（≤32K）· 0.6（32-256K） | 0.8 · 2.4 | 思考/非思考同价；Batch 半价 |
+| qwen3.7-plus | 2（≤256K） | 8 | 限时 8 折（1.6 / 6.4） |
+| qwen3.7-max | 12 | 36 | 限时 5 折（6 / 18） |
+
+成本结论：qwen3.7-flash 输入价仅 DeepSeek flash 的 1/7，输出价 1/5.6，是最省钱的初审选项（代价是召回低 15pp）；qwen3.7-max 折后仍比 DeepSeek flash 贵 4 倍（输入 6 vs 1.5），追平召回但不省钱。默认组合（DeepSeek 初审 + pro 二审）在「召回 + 稳定性 + 成本」三者中最均衡。
 
 ### 优化演进（每次改动的效果）
 
