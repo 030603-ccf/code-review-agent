@@ -94,16 +94,16 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 ### 实测结果（quixbugs、deepseek-v4-flash、开思考 + MAX_OUTPUT_TOKENS=16384）
 
-| 指标 | Java（40 buggy，重测） | Python（40 buggy，关思考旧值待重测） |
+| 指标 | Java（40 buggy） | Python（40 buggy） |
 | --- | --- | --- |
-| 行级召回率 | 92.5% | 60.0% |
-| 文件级召回率 | 100.0% | ~90% |
-| 文件级精确率 | 83.3% | 87.8% |
+| 行级召回率 | 92.5% | 77.5% |
+| 文件级召回率 | 100.0% | 97.5% |
+| 文件级精确率 | 83.3% | 79.6% |
 | JSON 失败 | 0 | 0 |
-| 全量耗时 | 234s | 34.2s |
-| Token | 313k | 61k |
+| 全量耗时 | 234s | 260s |
+| Token | 313k | 331k |
 
-召回率按**行级**报告：一条发现必须覆盖真实 bug 行（`scripts/analyze.py --correct-dir` 用正确版 diff 定位它）。文件级召回（Java 100% / Python ~90%）只统计「有发现落在 bug 文件」就计数，会虚高，不再作为标题指标。
+召回率按**行级**报告：一条发现必须覆盖真实 bug 行（`scripts/analyze.py --correct-dir` 用正确版 diff 定位它）。文件级召回（Java 100% / Python 97.5%）只统计「有发现落在 bug 文件」就计数，会虚高，不再作为标题指标。
 
 ### 多数据集测试效果
 
