@@ -40,10 +40,10 @@ BASE_DELAY = 2.0
 MAX_RETRY_ROUNDS = 1
 SECOND_REVIEW_WORKERS = 8
 SECOND_REVIEW_TIMEOUT = 120.0          # 小项目基础预算（秒）
-# 单次终审调用的预算（秒）：pro 思考模式实测单次约 13s，留余量取 20s。
-# 终审超时随「文件数 / 并发 × 该预算」伸缩，避免大项目（如 162 文件的
-# human-eval）在固定 120s 内跑不完、被误标「终审超时」。
-SECOND_REVIEW_PER_CALL_SECONDS = 20.0
+# 单次终审调用的预算（秒）：DeepSeek pro 实测约 13s，qwen3.7-plus 实测约 24s，
+# 留余量取 30s。终审超时随「文件数 / 并发 × 该预算」伸缩，避免大项目在固定
+# 120s 内跑不完、被误标「终审超时」。
+SECOND_REVIEW_PER_CALL_SECONDS = 30.0
 
 # 文件级过滤（按文件名 glob），目录级过滤统一走 lra.ignore。
 SKIP_GLOBS = ("*.min.js", "*.min.css", "*.min.js.map", "*.pb.go",
