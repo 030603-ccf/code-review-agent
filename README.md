@@ -125,6 +125,17 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 注：human-eval（163 文件）二审 `deepseek-v4-pro` 约需 253s 跑完——已把二审超时从固定 120s 改为随文件数伸缩（`SECOND_REVIEW_PER_CALL_SECONDS`），大项目不再被误标「终审超时」。初审结果进 sha1 缓存，重跑二审只花 ~189k token、0 初审请求。
 
+### 模型对比（行级召回，deepseek-v4-flash vs qwen3.7-flash）
+
+| 基准 | deepseek-v4-flash（开思考） | qwen3.7-flash（无思考） |
+| --- | --- | --- |
+| quixbugs Java | 92.5% | 75.0% |
+| quixbugs Python | 77.5% | 65.0% |
+| human-eval Java | 89.0% | 83.4% |
+| msr20 漏洞检出 | 2/3 | 2/3 |
+
+注：两列**非同口径**——DeepSeek 列开了思考、Qwen 列没开。DeepSeek 无思考时 Java 仅 55%、Python 60%，反而比 Qwen 无思考（75%/65%）更低；真正的分水岭是「开思考」而非模型本身。Qwen 若支持思考并开启，需重测后才能下结论（当前 Qwen 免费额度已耗尽，见下）。
+
 ### 优化演进（每次改动的效果）
 
 以下数字都在同一 quixbugs Java 集（48 文件）+ `deepseek-v4-flash` 上测出（除非注明）。「改前/改后」是真实运行，不是估算。
