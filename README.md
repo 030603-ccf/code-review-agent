@@ -86,7 +86,7 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 这些是 quixbugs 数据集真实 A/B 跑出来的经验结论。未经重新测量不要回退。
 
-1. **开思考模式 + 提高 `MAX_OUTPUT_TOKENS`。** 思考模式（`thinking: enabled`）显著提升检出率（quixbugs 行级召回 57.5%→92.5%、文件级 100%）。但 reasoning 与正文**共享 max_tokens 预算**，而 `reviewer.py` 的 `MAX_OUTPUT_TOKENS` 会覆盖 config.yaml 的 max_tokens——旧值 2048 会被 reasoning 吃满、截断正文 JSON（`no JSON object found`），这正是早先「关思考更好」的假象根源。正确姿势：`extra_body: {"thinking": {"type": "enabled"}}` 且 `MAX_OUTPUT_TOKENS = 16384`。代价 token ~2.5×（124k→313k），换来召回接近翻倍，划算。
+1. **开思考模式 + 提高 `MAX_OUTPUT_TOKENS`。** 思考模式（`thinking: enabled`）显著提升检出率（quixbugs 行级召回 57.5%→92.5%、文件级 100%）。但 reasoning 与正文**共享 max_tokens 预算**，而 `reviewer.py` 的 `MAX_OUTPUT_TOKENS` 会覆盖 config.yaml 的 max_tokens——旧值 2048 会被 reasoning 吃满、截断正文 JSON（`no JSON object found`），这正是早先「关思考更好」的假象根源。正确姿势：`extra_body: {"thinking": {"type": "enabled"}}` 且 `MAX_OUTPUT_TOKENS = 16384`。代价总 token ~2.5×（124k→313k，含二审），换来召回接近翻倍，划算。
 2. **用 `deepseek-v4-flash`，不要 `-pro`。** pro 实测每项都更差：12 个 JSON 失败 vs 5、315s vs 143s、362k vs 291k token —— 因为更强的模型反而**更不守格式**。对严格 JSON 输出，「听话」胜过「聪明」。
 3. **rpm 120、并发 16。** 探测 20/50/100 并发都零 429，旧的 `rpm: 6` 极度保守。8 倍提速。
 4. **sha1 发现缓存。** scan 已给每个文件算哈希；`review_chunk` 在 `(file, sha1, 行区间)` 命中缓存时跳过 LLM。键还嵌了模型名和 `CACHE_VERSION`（改 prompt/schema 时 +1），旧结果永不浮出。重复跑：0 请求、0.1s。
@@ -131,7 +131,7 @@ python -m lra review /path/to/project --no-cache           # 跳过 sha1 缓存
 
 | 改动 | 改前 | 改后 | 提升 |
 | --- | --- | --- | --- |
-| 开思考 + `MAX_OUTPUT_TOKENS` 2048→16384 | 行级召回 57.5%、文件级 ~95%、token 59k | 行级召回 92.5%、文件级 100%、token 313k | 召回 +35pp · 文件级 100%（token ~2.5×） |
+| 开思考 + `MAX_OUTPUT_TOKENS` 2048→16384 | 行级召回 57.5%、文件级 ~95%、总 token 124k | 行级召回 92.5%、文件级 100%、总 token 313k | 召回 +35pp · 文件级 100%（token ~2.5×） |
 | 关思考模式（`thinking: disabled`） | 5 个 JSON 失败、291k token、143.8s、50 发现 | 0 失败、59k token、28.3s、85 发现 | 失败清零 · -80% token · 5× 提速 |
 | rpm 6 → 120 + 并发 4 → 16 | 全量 1439s | 143.8s | 8.4× 提速 |
 | sha1 发现缓存 | 重复跑 28.3s / 59k token | 0.1s / 0 token | 零 LLM 请求 |
